@@ -4,6 +4,13 @@ An AI-agent-friendly local manager for manually operated Chromium browser profil
 Each profile has an independent `user-data-dir`, lifecycle, pages, optional fixed
 proxy route, and local management page.
 
+**Status: v0.1.0 · maintenance / frozen**
+
+This release is a local, manual-operation foundation: run it locally, keep browser
+profiles isolated, and open and operate them yourself. It is not an unattended
+browser runtime, autonomous Agent system, remote service, task queue, or long-term
+automation platform.
+
 ## Scope
 
 This is a local, manual v0.1 foundation. It is not a remote browser service,
