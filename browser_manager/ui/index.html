@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地浏览器档案管理</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">仅本机 · 127.0.0.1</p>
+        <h1>浏览器档案管理</h1>
+        <p class="subtitle">为每个账号保留独立浏览器数据和登录状态。</p>
+      </div>
+      <div class="mode-note"><strong>人工模式</strong><span>人工操作中不会被自动化接管</span></div>
+    </header>
+
+    <section class="notice" aria-label="运行限制">
+      <span>网络：每档案直连或固定代理</span>
+      <span>后台隐藏：P0-1 pending，当前不可用</span>
+      <span>焦点控制：不提供</span>
+    </section>
+
+    <section class="create-panel" aria-labelledby="create-title">
+      <div><h2 id="create-title">新增浏览器档案</h2><p>只创建独立档案记录，不会自动启动浏览器。</p></div>
+      <form id="create-form">
+        <label for="new-profile-name">档案名称</label>
+        <input id="new-profile-name" maxlength="80" required placeholder="例如：工作账号">
+        <button id="create-profile-button" type="submit" aria-busy="false">新增档案</button>
+      </form>
+    </section>
+
+    <p id="service-status" class="service-status" aria-live="polite">正在连接本地服务…</p>
+    <section id="profiles" class="profiles" aria-live="polite"></section>
+  </main>
+  <template id="profile-template">
+    <article class="profile-card">
+      <div class="card-head"><span class="color-dot"></span><div><h2 class="profile-name"></h2><code class="profile-id"></code></div><span class="status"></span></div>
+      <dl class="facts"><div><dt>模式</dt><dd>人工模式</dd></div><div><dt>标签页</dt><dd class="page-count">0</dd></div><div><dt>网络</dt><dd class="network-status">直连</dd></div><div><dt>后台隐藏</dt><dd>P0-1 pending / 不可用</dd></div></dl>
+      <p class="profile-note"></p>
+      <div class="actions"><button data-action="start" aria-busy="false">启动</button><button data-action="refresh" aria-busy="false">刷新标签页</button><button data-action="stop" class="danger" aria-busy="false">停止</button></div>
+      <div class="page-panel"><h3>标签页</h3><p class="page-empty">浏览器未运行或暂未发现标签页。</p><ul class="page-list"></ul></div>
+      <details class="settings"><summary>档案设置</summary><form class="settings-form"><label>显示名称<input name="display_name" maxlength="80" required></label><label>颜色标识<input name="color" type="color" required></label><label>备注<textarea name="note" maxlength="2000" rows="3" placeholder="仅保存在本机"></textarea></label><fieldset class="network-settings"><legend>网络出口</legend><label>连接方式<select name="network_mode"><option value="direct">直连</option><option value="fixed">固定代理</option></select></label><div class="proxy-fields" hidden><label>代理协议<select name="proxy_scheme"><option value="http">HTTP</option><option value="https">HTTPS</option><option value="socks5">SOCKS5</option></select></label><label>代理地址<input name="proxy_host" maxlength="253" placeholder="例如：proxy.example.com"></label><label>端口<input name="proxy_port" type="number" min="1" max="65535" inputmode="numeric" placeholder="例如：1080"></label><label>认证方式<select name="proxy_authentication"><option value="none">免认证 / IP 白名单</option><option value="basic">账号密码（仅 HTTP/HTTPS）</option></select></label><div class="proxy-credential-fields" hidden><label>代理账号<input name="proxy_username" maxlength="256" autocomplete="off"></label><label>代理密码<input name="proxy_password" type="password" maxlength="512" autocomplete="off"></label><p class="network-help">密码只在本机以 Windows 加密方式保存，页面不会回显。</p></div><p class="network-help">固定代理保存后下次启动生效；SOCKS5 不支持账号密码认证。</p></div><p class="network-help network-running" hidden>档案运行中不能修改网络出口；请先停止档案。</p></fieldset><div class="shortcut-editor"><span>平台快捷入口</span><div class="shortcut-inputs"><input name="shortcut_name" maxlength="80" placeholder="平台名"><input name="shortcut_url" type="url" placeholder="https://example.com"><button type="button" data-action="add-shortcut" aria-busy="false">添加</button></div><ul class="shortcut-list"></ul></div><button type="submit" data-action="save-settings" aria-busy="false">保存设置</button></form></details>
+    </article>
+  </template>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

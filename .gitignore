@@ -1,0 +1,30 @@
+.venv/
+__pycache__/
+*.py[cod]
+local-data/
+runtime/
+validation/
+tests/.artifacts/
+*.log
+*.jsonl
+*.png
+*.zip
+registry.json
+proxy-secrets.json
+ui-settings.json
+service-events.jsonl
+startup-check.json
+Cookies*
+Login Data*
+Preferences
+Secure Preferences
+History*
+Web Data*
+Local State*
+DevToolsActivePort
+Network Persistent State
+.env
+.env.*
+config.json
+config.local.json
+*.local.json

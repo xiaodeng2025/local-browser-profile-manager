@@ -1,0 +1,3 @@
+# Verified in the local development environment on 2026-08-22.
+# Chromium itself is supplied separately and is intentionally not versioned.
+playwright==1.60.0
