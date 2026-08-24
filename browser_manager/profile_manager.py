@@ -15,9 +15,10 @@ import subprocess
 import threading
 import time
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .network_config import normalize_network_config, proxy_launch_args, without_proxy_arguments
 from .permission_manager import PermissionPolicyError
@@ -32,6 +33,13 @@ class ProfileManagerError(RuntimeError):
 
 class ProfileProcessProbeError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ProcessProbeResult:
+    state: Literal["found", "absent", "error"]
+    processes: list[dict[str, Any]]
+    error: str | None = None
 
 
 def utc_now() -> str:
@@ -99,8 +107,8 @@ def foreground_snapshot() -> dict[str, int]:
     return {"hwnd": hwnd, "pid": int(pid.value)}
 
 
-def _query_profile_processes(user_data_dir: Path, *, strict: bool) -> list[dict[str, Any]]:
-    """Query Chrome processes, optionally failing closed on probe errors."""
+def probe_profile_processes(user_data_dir: Path) -> ProcessProbeResult:
+    """Return an explicit found/absent/error result for one Profile probe."""
     command = (
         "$items=@(Get-CimInstance Win32_Process | Where-Object "
         "{$_.Name -eq 'chrome.exe' -and $_.CommandLine} | "
@@ -117,28 +125,34 @@ def _query_profile_processes(user_data_dir: Path, *, strict: bool) -> list[dict[
             timeout=10,
         ).strip()
         if not raw:
-            return []
+            return ProcessProbeResult("absent", [])
         value = json.loads(raw)
         if isinstance(value, dict):
             value = [value]
-        return [
+        processes = [
             item for item in value
             if isinstance(item, dict) and profile_process_matches(str(item.get("CommandLine", "")), user_data_dir)
         ]
+        return ProcessProbeResult("found", processes) if processes else ProcessProbeResult("absent", [])
     except Exception as exc:
-        if strict:
-            raise ProfileProcessProbeError(f"profile_process_probe_failed:{type(exc).__name__}: {exc}") from exc
-        return []
+        return ProcessProbeResult(
+            "error",
+            [],
+            f"profile_process_probe_failed:{type(exc).__name__}: {exc}",
+        )
 
 
 def query_profile_processes(user_data_dir: Path) -> list[dict[str, Any]]:
-    """Return Chrome processes while preserving the legacy empty-list behavior."""
-    return _query_profile_processes(user_data_dir, strict=False)
+    """Return processes or raise; probe errors are never represented as ``[]``."""
+    result = probe_profile_processes(user_data_dir)
+    if result.state == "error":
+        raise ProfileProcessProbeError(result.error or "profile_process_probe_failed")
+    return result.processes
 
 
 def query_profile_processes_strict(user_data_dir: Path) -> list[dict[str, Any]]:
-    """Return Chrome processes or raise when the startup safety probe fails."""
-    return _query_profile_processes(user_data_dir, strict=True)
+    """Compatibility wrapper returning processes or raising on probe failure."""
+    return query_profile_processes(user_data_dir)
 
 
 def query_profile_windows(user_data_dir: Path) -> list[int]:
@@ -360,6 +374,18 @@ class ProfileManager:
     def _lifecycle_lock_for(self, profile_id: str) -> asyncio.Lock:
         return self._lifecycle_locks.setdefault(profile_id, asyncio.Lock())
 
+    @staticmethod
+    def _process_probe_error(exc: ProfileProcessProbeError) -> str:
+        return f"process_probe_failed:{exc}"
+
+    @staticmethod
+    def _record_process_ids(record: dict[str, Any]) -> list[int]:
+        return sorted({
+            int(pid)
+            for pid in record.get("process_ids", [])
+            if not isinstance(pid, bool) and str(pid).isdigit()
+        })
+
     def _mark_recovery_required(self, record: dict[str, Any], error: str, processes: list[dict[str, Any]] | None = None) -> None:
         record.update({
             "status": "error",
@@ -540,8 +566,21 @@ class ProfileManager:
                 await browser.close()
             except Exception:
                 pass
-        processes = await self._wait_for_processes(profile_id, False, timeout=8.0)
+        try:
+            processes = await self._wait_for_processes(profile_id, False, timeout=8.0)
+        except ProfileProcessProbeError as exc:
+            error = self._process_probe_error(exc)
+            return {
+                "graceful_error": error,
+                "probe_error": error,
+                "graceful": False,
+                "fallback_pids": [],
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "remaining_processes": self._record_process_ids(record),
+                "remaining_hwnds": [],
+            }
         forced: list[int] = []
+        probe_error: str | None = None
         if processes and fallback:
             pids = sorted({int(item["ProcessId"]) for item in processes if str(item.get("ProcessId", "")).isdigit()})
             root_pid = int(runtime.get("root_pid") or record.get("root_pid") or 0)
@@ -551,14 +590,18 @@ class ProfileManager:
                 expression = "$ids=@(" + ",".join(str(pid) for pid in sorted(set(pids))) + "); foreach($id in $ids){Stop-Process -Id $id -Force -ErrorAction SilentlyContinue}"
                 subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", expression], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 forced = sorted(set(pids))
-                processes = await self._wait_for_processes(profile_id, False, timeout=8.0)
+                try:
+                    processes = await self._wait_for_processes(profile_id, False, timeout=8.0)
+                except ProfileProcessProbeError as exc:
+                    probe_error = self._process_probe_error(exc)
         return {
             "graceful_error": graceful_error,
-            "graceful": not processes,
+            "probe_error": probe_error,
+            "graceful": not processes and probe_error is None,
             "fallback_pids": forced,
             "elapsed_ms": round((time.monotonic() - started) * 1000),
             "remaining_processes": [int(item["ProcessId"]) for item in processes if str(item.get("ProcessId", "")).isdigit()],
-            "remaining_hwnds": query_profile_windows(Path(record["user_data_dir"])),
+            "remaining_hwnds": [],
         }
 
     async def start(self, profile_id: str) -> dict[str, Any]:
@@ -630,6 +673,22 @@ class ProfileManager:
                 runtime.update({"monitor": monitor, "expected_stop": False})
                 self._runtime[profile_id] = runtime
                 return dict(record)
+            except ProfileProcessProbeError as exc:
+                last_error = self._process_probe_error(exc)
+                record["last_error"] = last_error
+                record["startup_stage"] = "error"
+                if runtime is not None:
+                    try:
+                        await self._shutdown_runtime(profile_id, runtime, fallback=True)
+                    except Exception:
+                        pass
+                try:
+                    await self._wait_for_processes(profile_id, False, timeout=5.0)
+                except ProfileProcessProbeError:
+                    pass
+                if attempt < self.max_retries:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 record["last_error"] = last_error
@@ -649,7 +708,10 @@ class ProfileManager:
                         await self._shutdown_runtime(profile_id, {"root_pid": record.get("root_pid")}, fallback=True)
                     except Exception:
                         pass
-                await self._wait_for_processes(profile_id, False, timeout=5.0)
+                try:
+                    await self._wait_for_processes(profile_id, False, timeout=5.0)
+                except ProfileProcessProbeError:
+                    pass
                 if attempt < self.max_retries:
                     await asyncio.sleep(0.5 * (attempt + 1))
         record.update({"status": "error", "last_error": last_error, "process_ids": [], "startup_stage": "error", "project_hwnds": [], "target_id": None})
@@ -662,7 +724,13 @@ class ProfileManager:
             runtime = self._runtime.get(profile_id)
             if record is None or runtime is None or record.get("status") != "running":
                 return
-            processes = await asyncio.to_thread(query_profile_processes, Path(record["user_data_dir"]))
+            try:
+                processes = await asyncio.to_thread(query_profile_processes, Path(record["user_data_dir"]))
+            except ProfileProcessProbeError as exc:
+                record["last_error"] = self._process_probe_error(exc)
+                self._save()
+                await asyncio.sleep(self.monitor_interval)
+                continue
             if not processes:
                 expected = bool(runtime.get("expected_stop"))
                 try:
@@ -681,24 +749,42 @@ class ProfileManager:
                 record["startup_stage"] = "stopped" if expected else "error"
                 self._save()
                 return
+            if str(record.get("last_error", "")).startswith("process_probe_failed:"):
+                record["last_error"] = None
             record["process_ids"] = [p["ProcessId"] for p in processes]
-            record["project_hwnds"] = query_profile_windows(Path(record["user_data_dir"]))
+            try:
+                record["project_hwnds"] = query_profile_windows(Path(record["user_data_dir"]))
+            except ProfileProcessProbeError as exc:
+                record["last_error"] = self._process_probe_error(exc)
+                self._save()
+                await asyncio.sleep(self.monitor_interval)
+                continue
             await asyncio.sleep(self.monitor_interval)
 
     async def status(self, profile_id: str) -> dict[str, Any]:
         record = self._records.get(profile_id)
         if record is None:
             raise ProfileManagerError(f"unknown profile: {profile_id}")
-        if record.get("status") == "running" and not await asyncio.to_thread(query_profile_processes, Path(record["user_data_dir"])):
-            runtime = self._runtime.pop(profile_id, None)
-            if runtime:
-                runtime["monitor"].cancel()
-                try:
-                    await runtime["context"].close()
-                except Exception:
-                    pass
-            record.update({"status": "error", "process_ids": [], "last_error": "browser_process_disappeared"})
-            self._save()
+        if record.get("status") == "running":
+            try:
+                processes = await asyncio.to_thread(query_profile_processes, Path(record["user_data_dir"]))
+            except ProfileProcessProbeError as exc:
+                record["last_error"] = self._process_probe_error(exc)
+                self._save()
+                return dict(record)
+            if processes and str(record.get("last_error", "")).startswith("process_probe_failed:"):
+                record["last_error"] = None
+                self._save()
+            if not processes:
+                runtime = self._runtime.pop(profile_id, None)
+                if runtime:
+                    runtime["monitor"].cancel()
+                    try:
+                        await runtime["context"].close()
+                    except Exception:
+                        pass
+                record.update({"status": "error", "process_ids": [], "last_error": "browser_process_disappeared"})
+                self._save()
         return dict(record)
 
     async def stop(self, profile_id: str) -> dict[str, Any]:
@@ -725,10 +811,38 @@ class ProfileManager:
                 pass
             cleanup = await self._shutdown_runtime(profile_id, runtime, fallback=True)
         else:
-            cleanup = {"graceful": not query_profile_processes(Path(record["user_data_dir"])), "fallback_pids": [], "remaining_processes": [], "remaining_hwnds": query_profile_windows(Path(record["user_data_dir"]))}
-        processes = query_profile_processes(Path(record["user_data_dir"]))
+            try:
+                processes = query_profile_processes(Path(record["user_data_dir"]))
+                cleanup = {"graceful": not processes, "probe_error": None, "fallback_pids": [], "remaining_processes": [], "remaining_hwnds": query_profile_windows(Path(record["user_data_dir"]))}
+            except ProfileProcessProbeError as exc:
+                error = self._process_probe_error(exc)
+                record.update({"status": "error", "last_error": error, "startup_stage": "error"})
+                record["last_cleanup"] = {"graceful": False, "probe_error": error, "fallback_pids": [], "remaining_processes": self._record_process_ids(record), "remaining_hwnds": []}
+                self._save()
+                return dict(record)
+        try:
+            processes = query_profile_processes(Path(record["user_data_dir"]))
+        except ProfileProcessProbeError as exc:
+            error = self._process_probe_error(exc)
+            record.update({"status": "error", "last_error": error, "startup_stage": "error"})
+            record["last_cleanup"] = {**cleanup, "graceful": False, "probe_error": error}
+            self._save()
+            return dict(record)
+        if cleanup.get("probe_error"):
+            record.update({"status": "error", "last_error": cleanup["probe_error"], "startup_stage": "error"})
+            record["last_cleanup"] = cleanup
+            self._save()
+            return dict(record)
         if processes:
-            record.update({"status": "error", "process_ids": [p["ProcessId"] for p in processes], "last_error": "profile_processes_remain", "startup_stage": "error", "project_hwnds": query_profile_windows(Path(record["user_data_dir"]))})
+            try:
+                project_hwnds = query_profile_windows(Path(record["user_data_dir"]))
+            except ProfileProcessProbeError as exc:
+                error = self._process_probe_error(exc)
+                record.update({"status": "error", "process_ids": [p["ProcessId"] for p in processes], "last_error": error, "startup_stage": "error"})
+                record["last_cleanup"] = {**cleanup, "graceful": False, "probe_error": error}
+                self._save()
+                return dict(record)
+            record.update({"status": "error", "process_ids": [p["ProcessId"] for p in processes], "last_error": "profile_processes_remain", "startup_stage": "error", "project_hwnds": project_hwnds})
         else:
             record.update({"status": "stopped", "process_ids": [], "root_pid": None, "debug_endpoint": None, "startup_stage": "stopped", "project_hwnds": [], "target_id": None, "last_error": None})
         record["last_cleanup"] = cleanup

@@ -133,6 +133,33 @@ lifecycle lock，但本轮未观察到状态覆盖、假 `browser_process_disapp
 完整 lifecycle 状态机、Monitor tri-state、ProcessObserver 和其他架构加固仍为
 Deferred；Fix Unit 2 不扩大为这些后续工作。
 
+## Fix Unit 3 checkpoint：process probe error semantics（2026-08-24）
+
+在保持 Fix Unit 1 的 `recovery_required` / orphan 语义和 Fix Unit 2 的
+per-profile lifecycle lock 不变的前提下，进程探测现在明确区分三种结果：
+
+- `found`：探测成功且发现目标 Profile 的 Chrome 进程；
+- `absent`：探测成功且确认没有目标 Chrome 进程；
+- `error`：PowerShell/CIM、超时、JSON 解析或其他探测本身失败。
+
+`error` 不再等价于 `absent`。Monitor、`status()`、`start()`、`stop()` 和
+recovery reconciliation 均使用 fail-safe 语义：只有明确的 `absent` 才能作为
+“没有目标 Chrome”的证据；探测失败会保留当前安全边界、记录
+`process_probe_failed` 诊断，并阻止可能造成误启动或误停止的决策。stop 期间
+探测失败也不会写成 `stopped`；Registry 中的整数 `process_ids` 会安全保留为
+可诊断的 `remaining_processes`。
+
+验证结果：reliability tests 29/29 通过；全量 unit tests 34/34 通过；
+`git diff --check` 通过。Windows Chromium 实机验收通过：正常 found/absent、
+running Monitor probe failure、stop probe failure、orphan recovery probe failure、
+live orphan re-confirmation、人工清理后的 successful absent reconciliation、
+重新启动和最终 stop 均符合验收标准；未观察到第二个 root Chrome，也未观察到
+Fix Unit 1 / Fix Unit 2 回归。Chromium 子进程 PID 集合允许动态变化，验收以
+root PID、精确 Profile 路径匹配和生命周期状态不变量为准。
+
+HTTP API 的部分错误状态码与 Profile `status=error` 返回语义仍属于 Deferred，
+本单元不做 API 状态码整体重构。
+
 ## v0.1 冻结维护状态
 
 公开仓库 v0.1 定位为本地人工操作冻结版：本地运行、多 Profile 隔离、人工打开
@@ -163,7 +190,8 @@ Deferred；Fix Unit 2 不扩大为这些后续工作。
 
 本单元没有实现完整生命周期状态机、Manager 自动恢复、重复 PowerShell 扫描、
 ProcessObserver、Page Lock、UI 或其他审查项。Monitor 没有纳入 lifecycle lock，
-仍使用原有的空列表错误语义；本轮实机未观察到它干扰 lifecycle。
+但其进程探测现在能区分 `found`、`absent` 和 `error`；本轮实机未观察到它干扰
+lifecycle。
 
 当前 fail-safe 不会终止或接管 orphan Chrome；用户仍需人工处理 orphan，随后
 由 Manager 通过新的严格空探测解除 recovery。若 Manager 重启时其他 Profile

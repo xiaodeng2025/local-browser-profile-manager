@@ -21,6 +21,9 @@ Not included or guaranteed:
 - An orphan must be closed manually. Only after strict `--user-data-dir`
   process detection confirms no matching Chrome remains will Manager reconcile
   the Profile to `stopped` and allow a normal start again.
+- A process-probe failure is treated as an unknown/error state, not as proof that
+  Chrome is absent. Affected lifecycle or reconciliation decisions remain
+  fail-safe until a later probe succeeds.
 - Directly calling `stop()` on an orphan after Manager restart is not supported
   in v0.1. The lifecycle API may return HTTP 200 while the returned Profile
   remains `status=error` with `profile_processes_remain`; this API semantic is

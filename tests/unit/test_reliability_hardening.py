@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from browser_manager.instance_lock import DataDirInstanceLock, DataDirLockError
-from browser_manager.profile_manager import ProfileManager, ProfileManagerError, ProfileProcessProbeError, profile_process_matches, query_profile_processes
+from browser_manager.profile_manager import ProfileManager, ProfileManagerError, ProfileProcessProbeError, profile_process_matches, probe_profile_processes, query_profile_processes
 
 
 class _FakePage:
@@ -227,6 +227,141 @@ class ReliabilityHardeningTests(unittest.TestCase):
                 with self.assertRaises(ProfileManagerError) as raised:
                     __import__("asyncio").run(manager.start("Profile-10"))
             self.assertIn("recovery_required:process_probe_failed", str(raised.exception))
+
+    def test_process_probe_error_is_not_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "Profile-10"
+            with patch("browser_manager.profile_manager.subprocess.check_output", side_effect=subprocess.TimeoutExpired("powershell", 1)):
+                result = probe_profile_processes(target)
+                self.assertEqual(result.state, "error")
+                self.assertEqual(result.processes, [])
+                with self.assertRaises(ProfileProcessProbeError):
+                    query_profile_processes(target)
+
+    def test_successful_empty_probe_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "Profile-10"
+            with patch("browser_manager.profile_manager.subprocess.check_output", return_value=b"[]"):
+                result = probe_profile_processes(target)
+            self.assertEqual(result.state, "absent")
+            self.assertEqual(result.processes, [])
+
+    def test_running_monitor_probe_error_preserves_running_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root, "Profile-10", "running")
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", return_value=[]):
+                manager = self._manager(root, [record])
+            manager._records["Profile-10"].update({"status": "running", "process_ids": [13010], "startup_stage": "running"})
+
+            async def scenario():
+                manager.monitor_interval = 0.01
+                manager._runtime["Profile-10"] = {"context": _FakeContext()}
+                task = asyncio.create_task(manager._monitor("Profile-10"))
+                await asyncio.sleep(0)
+                await asyncio.sleep(0.05)
+                loaded = manager.get("Profile-10")
+                self.assertEqual(loaded["status"], "running")
+                self.assertIn("process_probe_failed", str(loaded["last_error"]))
+                self.assertNotEqual(loaded["last_error"], "browser_process_disappeared")
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            with patch("browser_manager.profile_manager.query_profile_processes", side_effect=ProfileProcessProbeError("synthetic_probe_failure")):
+                asyncio.run(scenario())
+
+    def test_stopped_profile_probe_error_fails_start_safe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root, "Profile-10", "stopped")
+            probe_error = ProfileProcessProbeError("synthetic_probe_failure")
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", side_effect=probe_error):
+                manager = self._manager(root, [record])
+                launch = AsyncMock()
+                manager._launch_background_runtime = launch
+                with self.assertRaises(ProfileManagerError) as raised:
+                    __import__("asyncio").run(manager.start("Profile-10"))
+            self.assertIn("recovery_required:process_probe_failed", str(raised.exception))
+            self.assertEqual(launch.await_count, 0)
+            self.assertEqual(manager.get("Profile-10")["status"], "error")
+
+    def test_stop_probe_error_does_not_report_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root, "Profile-10", "running")
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", return_value=[]):
+                manager = self._manager(root, [record])
+            manager._records["Profile-10"].update({"status": "running", "process_ids": [13011], "startup_stage": "running"})
+            with patch("browser_manager.profile_manager.query_profile_processes", side_effect=ProfileProcessProbeError("synthetic_probe_failure")):
+                result = __import__("asyncio").run(manager.stop("Profile-10"))
+            self.assertEqual(result["status"], "error")
+            self.assertIn("process_probe_failed", str(result["last_error"]))
+            self.assertNotEqual(result["status"], "stopped")
+
+    def test_stop_probe_error_handles_integer_registry_process_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root, "Profile-10", "running")
+            record.update({"process_ids": [13011, 13012], "root_pid": 13011})
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", return_value=[]):
+                manager = self._manager(root, [record])
+            manager._records["Profile-10"].update({"status": "running", "startup_stage": "running", "process_ids": [13011, 13012], "root_pid": 13011})
+
+            async def scenario():
+                monitor = asyncio.get_running_loop().create_future()
+                monitor.set_result(None)
+                manager._runtime["Profile-10"] = {
+                    "context": _FakeContext(),
+                    "browser": None,
+                    "cdp": None,
+                    "root_pid": 13011,
+                    "monitor": monitor,
+                    "proxy_auth_tasks": set(),
+                }
+                return await manager.stop("Profile-10")
+
+            with patch(
+                "browser_manager.profile_manager.query_profile_processes",
+                side_effect=ProfileProcessProbeError("synthetic_probe_failure"),
+            ):
+                result = asyncio.run(scenario())
+
+            self.assertEqual(result["status"], "error")
+            self.assertIn("process_probe_failed", str(result["last_error"]))
+            self.assertNotEqual(result["status"], "stopped")
+            self.assertEqual(result["last_cleanup"]["remaining_processes"], [13011, 13012])
+
+    def test_shutdown_runtime_found_then_absent_keeps_normal_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root, "Profile-10", "running")
+            record.update({"process_ids": [13021], "root_pid": 13021})
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", return_value=[]):
+                manager = self._manager(root, [record])
+
+            async def scenario():
+                manager._records["Profile-10"].update({"status": "running", "process_ids": [13021], "root_pid": 13021})
+                manager._wait_for_processes = AsyncMock(side_effect=[
+                    [{"ProcessId": 13021, "Name": "chrome.exe", "CommandLine": "synthetic"}],
+                    [],
+                ])
+                runtime = {
+                    "context": _FakeContext(),
+                    "browser": None,
+                    "cdp": None,
+                    "root_pid": 13021,
+                    "proxy_auth_tasks": set(),
+                }
+                with patch("browser_manager.profile_manager.subprocess.run") as run:
+                    result = await manager._shutdown_runtime("Profile-10", runtime, fallback=True)
+                return result, run
+
+            result, run = asyncio.run(scenario())
+            self.assertTrue(result["graceful"])
+            self.assertEqual(result["fallback_pids"], [13021])
+            self.assertEqual(result["remaining_processes"], [])
+            run.assert_called_once()
 
     def test_orphan_cleanup_then_manager_restart_restores_startable_state(self):
         with tempfile.TemporaryDirectory() as directory:
