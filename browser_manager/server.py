@@ -23,6 +23,7 @@ from typing import Any
 from playwright.async_api import async_playwright
 
 from .api import LocalProfileAPI
+from .instance_lock import DataDirInstanceLock
 from .local_management_ui import UISettingsStore, start_management_ui_server
 from .permission_manager import PermissionManager
 from .profile_manager import ProfileManager
@@ -70,10 +71,13 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     if not chrome.is_file():
         raise FileNotFoundError(f"chrome_not_found:{chrome}")
     data_dir.mkdir(parents=True, exist_ok=True)
-    ready_server, ready_url = start_ready_server()
+    data_dir_lock = DataDirInstanceLock(data_dir)
+    data_dir_lock.acquire()
+    ready_server = None
     api: LocalProfileAPI | None = None
     ui_server: ThreadingHTTPServer | None = None
     try:
+        ready_server, ready_url = start_ready_server()
         async with async_playwright() as playwright:
             proxy_credentials = ProxyCredentialStore(data_dir / "proxy-secrets.json")
             manager = ProfileManager(
@@ -156,13 +160,17 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             # A long-running local service ends only with console interruption.
             await asyncio.Event().wait()
     finally:
-        if ui_server is not None:
-            ui_server.shutdown()
-            ui_server.server_close()
-        if api is not None:
-            await api.close()
-        ready_server.shutdown()
-        ready_server.server_close()
+        try:
+            if ui_server is not None:
+                ui_server.shutdown()
+                ui_server.server_close()
+            if api is not None:
+                await api.close()
+            if ready_server is not None:
+                ready_server.shutdown()
+                ready_server.server_close()
+        finally:
+            data_dir_lock.release()
 
 
 def main() -> None:

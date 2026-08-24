@@ -10,6 +10,7 @@ import asyncio
 import ctypes
 import json
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -33,6 +34,57 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _command_line_arguments(command_line: str) -> list[str]:
+    if not isinstance(command_line, str):
+        return []
+    if os.name != "nt":
+        try:
+            return shlex.split(command_line, posix=False)
+        except ValueError:
+            return []
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    argc = ctypes.c_int()
+    shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    argv = shell32.CommandLineToArgvW(command_line, ctypes.byref(argc))
+    if not argv:
+        return []
+    try:
+        return [argv[index] for index in range(argc.value)]
+    finally:
+        kernel32.LocalFree(argv)
+
+
+def _strip_argument_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return value[1:-1]
+    return value
+
+
+def _extract_user_data_dir(command_line: str) -> str | None:
+    arguments = _command_line_arguments(command_line)
+    for index, argument in enumerate(arguments):
+        lower = argument.lower()
+        if lower == "--user-data-dir" and index + 1 < len(arguments):
+            return _strip_argument_quotes(arguments[index + 1])
+        if lower.startswith("--user-data-dir="):
+            return _strip_argument_quotes(argument.split("=", 1)[1])
+    return None
+
+
+def _normalized_user_data_dir(value: str | Path) -> str:
+    return os.path.normcase(os.path.normpath(str(Path(value).resolve(strict=False))))
+
+
+def profile_process_matches(command_line: str, user_data_dir: Path) -> bool:
+    actual = _extract_user_data_dir(command_line)
+    return actual is not None and _normalized_user_data_dir(actual) == _normalized_user_data_dir(user_data_dir)
+
+
 def foreground_snapshot() -> dict[str, int]:
     """Read the current foreground HWND/PID; never changes either one."""
     user32 = ctypes.windll.user32
@@ -44,13 +96,10 @@ def foreground_snapshot() -> dict[str, int]:
 
 
 def query_profile_processes(user_data_dir: Path) -> list[dict[str, Any]]:
-    """Return only Chrome processes whose command line contains this exact profile root."""
-    root = str(user_data_dir.resolve()).rstrip("\\/").replace("'", "''")
+    """Return Chrome processes whose parsed user-data-dir equals this Profile."""
     command = (
-        "$root='" + root + "'.ToLower(); "
         "$items=@(Get-CimInstance Win32_Process | Where-Object "
-        "{$_.Name -eq 'chrome.exe' -and $_.CommandLine -and "
-        "$_.CommandLine.ToLower().Contains($root)} | "
+        "{$_.Name -eq 'chrome.exe' -and $_.CommandLine} | "
         "Select-Object ProcessId,Name,CommandLine); "
         "$items | ConvertTo-Json -Compress"
     )
@@ -68,7 +117,10 @@ def query_profile_processes(user_data_dir: Path) -> list[dict[str, Any]]:
         value = json.loads(raw)
         if isinstance(value, dict):
             value = [value]
-        return value
+        return [
+            item for item in value
+            if isinstance(item, dict) and profile_process_matches(str(item.get("CommandLine", "")), user_data_dir)
+        ]
     except Exception:
         return []
 
