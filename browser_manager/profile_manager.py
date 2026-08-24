@@ -197,6 +197,7 @@ class ProfileManager:
         self.proxy_credentials = proxy_credentials
         self._runtime: dict[str, dict[str, Any]] = {}
         self._records: dict[str, dict[str, Any]] = {}
+        self._lifecycle_locks: dict[str, asyncio.Lock] = {}
         self._load()
 
     def _load(self) -> None:
@@ -355,6 +356,9 @@ class ProfileManager:
 
     def _count_starting_or_running(self) -> int:
         return sum(item.get("status") in {"starting", "running"} for item in self._records.values())
+
+    def _lifecycle_lock_for(self, profile_id: str) -> asyncio.Lock:
+        return self._lifecycle_locks.setdefault(profile_id, asyncio.Lock())
 
     def _mark_recovery_required(self, record: dict[str, Any], error: str, processes: list[dict[str, Any]] | None = None) -> None:
         record.update({
@@ -558,6 +562,12 @@ class ProfileManager:
         }
 
     async def start(self, profile_id: str) -> dict[str, Any]:
+        if profile_id not in self._records:
+            raise ProfileManagerError(f"unknown profile: {profile_id}")
+        async with self._lifecycle_lock_for(profile_id):
+            return await self._start_unlocked(profile_id)
+
+    async def _start_unlocked(self, profile_id: str) -> dict[str, Any]:
         record = self._records.get(profile_id)
         if record is None:
             raise ProfileManagerError(f"unknown profile: {profile_id}")
@@ -692,6 +702,12 @@ class ProfileManager:
         return dict(record)
 
     async def stop(self, profile_id: str) -> dict[str, Any]:
+        if profile_id not in self._records:
+            raise ProfileManagerError(f"unknown profile: {profile_id}")
+        async with self._lifecycle_lock_for(profile_id):
+            return await self._stop_unlocked(profile_id)
+
+    async def _stop_unlocked(self, profile_id: str) -> dict[str, Any]:
         record = self._records.get(profile_id)
         if record is None:
             raise ProfileManagerError(f"unknown profile: {profile_id}")
@@ -720,8 +736,11 @@ class ProfileManager:
         return dict(record)
 
     async def restart(self, profile_id: str) -> dict[str, Any]:
-        await self.stop(profile_id)
-        return await self.start(profile_id)
+        if profile_id not in self._records:
+            raise ProfileManagerError(f"unknown profile: {profile_id}")
+        async with self._lifecycle_lock_for(profile_id):
+            await self._stop_unlocked(profile_id)
+            return await self._start_unlocked(profile_id)
 
     async def start_many(self, profile_ids: list[str], starting_limit: int | None = None) -> list[dict[str, Any]]:
         semaphore = asyncio.Semaphore(starting_limit) if starting_limit else None

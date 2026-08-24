@@ -1,4 +1,5 @@
 import multiprocessing
+import asyncio
 import json
 import subprocess
 import tempfile
@@ -9,6 +10,24 @@ from unittest.mock import patch
 
 from browser_manager.instance_lock import DataDirInstanceLock, DataDirLockError
 from browser_manager.profile_manager import ProfileManager, ProfileManagerError, ProfileProcessProbeError, profile_process_matches, query_profile_processes
+
+
+class _FakePage:
+    async def goto(self, *_args, **_kwargs):
+        return None
+
+    async def title(self):
+        return ""
+
+    async def evaluate(self, *_args, **_kwargs):
+        return "complete"
+
+
+class _FakeContext:
+    pages: list = []
+
+    async def close(self):
+        return None
 
 
 def _hold_data_dir_lock(data_dir: str, ready, release) -> None:
@@ -233,6 +252,226 @@ class ReliabilityHardeningTests(unittest.TestCase):
             self.assertIsNone(manager.get("Profile-10")["last_error"])
             self.assertEqual(manager.get("Profile-100")["status"], "stopped")
             self.assertIsNone(manager.get("Profile-100")["last_error"])
+
+    def test_concurrent_start_start_same_profile_launches_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root, "Profile-10", "stopped")
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", return_value=[]), patch("browser_manager.profile_manager.query_profile_windows", return_value=[]):
+                manager = self._manager(root, [record])
+
+                async def scenario():
+                    launch_entered = asyncio.Event()
+                    release_launch = asyncio.Event()
+                    launch_count = 0
+                    root_pid = 12010
+
+                    async def launch(profile_id, current_record):
+                        nonlocal launch_count
+                        launch_count += 1
+                        current_record["root_pid"] = root_pid
+                        launch_entered.set()
+                        await release_launch.wait()
+                        return {"context": _FakeContext(), "browser": None, "cdp": None, "page": _FakePage(), "root_pid": root_pid, "target_id": None}
+
+                    async def wait_for_processes(_profile_id, present, timeout=10.0):
+                        return [{"ProcessId": root_pid, "Name": "chrome.exe", "CommandLine": "synthetic"}] if present else []
+
+                    manager._launch_background_runtime = launch
+                    manager._wait_for_processes = wait_for_processes
+                    manager._monitor = lambda _profile_id: asyncio.sleep(3600)
+                    first = asyncio.create_task(manager.start("Profile-10"))
+                    await asyncio.wait_for(launch_entered.wait(), 1)
+                    second = asyncio.create_task(manager.start("Profile-10"))
+                    await asyncio.sleep(0)
+                    release_launch.set()
+                    first_result, second_result = await asyncio.wait_for(asyncio.gather(first, second), 2)
+                    self.assertEqual(launch_count, 1)
+                    self.assertEqual(len(manager._runtime), 1)
+                    self.assertEqual(first_result["status"], "running")
+                    self.assertEqual(second_result["status"], "running")
+                    await manager.stop("Profile-10")
+
+                asyncio.run(scenario())
+
+    def test_concurrent_start_stop_same_profile_serializes_runtime_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root, "Profile-10", "stopped")
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", return_value=[]), patch("browser_manager.profile_manager.query_profile_windows", return_value=[]):
+                manager = self._manager(root, [record])
+
+                async def scenario():
+                    launch_entered = asyncio.Event()
+                    release_launch = asyncio.Event()
+                    launch_count = 0
+                    root_pid = 12011
+
+                    async def launch(profile_id, current_record):
+                        nonlocal launch_count
+                        launch_count += 1
+                        current_record["root_pid"] = root_pid
+                        launch_entered.set()
+                        await release_launch.wait()
+                        return {"context": _FakeContext(), "browser": None, "cdp": None, "page": _FakePage(), "root_pid": root_pid, "target_id": None}
+
+                    async def wait_for_processes(_profile_id, present, timeout=10.0):
+                        return [{"ProcessId": root_pid, "Name": "chrome.exe", "CommandLine": "synthetic"}] if present else []
+
+                    manager._launch_background_runtime = launch
+                    manager._wait_for_processes = wait_for_processes
+                    manager._monitor = lambda _profile_id: asyncio.sleep(3600)
+                    start_task = asyncio.create_task(manager.start("Profile-10"))
+                    await asyncio.wait_for(launch_entered.wait(), 1)
+                    stop_task = asyncio.create_task(manager.stop("Profile-10"))
+                    await asyncio.sleep(0)
+                    release_launch.set()
+                    start_result, stop_result = await asyncio.wait_for(asyncio.gather(start_task, stop_task), 2)
+                    self.assertEqual(launch_count, 1)
+                    self.assertEqual(start_result["status"], "running")
+                    self.assertEqual(stop_result["status"], "stopped")
+                    self.assertEqual(manager.get("Profile-10")["status"], "stopped")
+                    self.assertEqual(manager._runtime, {})
+
+                asyncio.run(scenario())
+
+    def test_concurrent_restart_start_same_profile_serializes_without_deadlock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root, "Profile-10", "stopped")
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", return_value=[]), patch("browser_manager.profile_manager.query_profile_windows", return_value=[]):
+                manager = self._manager(root, [record])
+
+                async def scenario():
+                    launch_entered = asyncio.Event()
+                    release_launch = asyncio.Event()
+                    launch_count = 0
+                    root_pid = 12012
+
+                    async def launch(profile_id, current_record):
+                        nonlocal launch_count
+                        launch_count += 1
+                        current_record["root_pid"] = root_pid
+                        launch_entered.set()
+                        await release_launch.wait()
+                        return {"context": _FakeContext(), "browser": None, "cdp": None, "page": _FakePage(), "root_pid": root_pid, "target_id": None}
+
+                    async def wait_for_processes(_profile_id, present, timeout=10.0):
+                        return [{"ProcessId": root_pid, "Name": "chrome.exe", "CommandLine": "synthetic"}] if present else []
+
+                    manager._launch_background_runtime = launch
+                    manager._wait_for_processes = wait_for_processes
+                    manager._monitor = lambda _profile_id: asyncio.sleep(3600)
+                    restart_task = asyncio.create_task(manager.restart("Profile-10"))
+                    await asyncio.wait_for(launch_entered.wait(), 1)
+                    start_task = asyncio.create_task(manager.start("Profile-10"))
+                    await asyncio.sleep(0)
+                    release_launch.set()
+                    restart_result, start_result = await asyncio.wait_for(asyncio.gather(restart_task, start_task), 2)
+                    self.assertEqual(launch_count, 1)
+                    self.assertEqual(restart_result["status"], "running")
+                    self.assertEqual(start_result["status"], "running")
+                    self.assertEqual(len(manager._runtime), 1)
+                    await manager.stop("Profile-10")
+
+                asyncio.run(scenario())
+
+    def test_concurrent_stop_stop_same_profile_shutdowns_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root, "Profile-10", "running")
+            record["root_pid"] = 12013
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", return_value=[]), patch("browser_manager.profile_manager.query_profile_processes", return_value=[]), patch("browser_manager.profile_manager.query_profile_windows", return_value=[]):
+                manager = self._manager(root, [record])
+                manager._records["Profile-10"].update({"status": "running", "process_ids": [12013], "startup_stage": "running"})
+
+                async def scenario():
+                    monitor = asyncio.create_task(asyncio.sleep(3600))
+                    manager._runtime["Profile-10"] = {"monitor": monitor, "root_pid": 12013}
+                    shutdown_entered = asyncio.Event()
+                    release_shutdown = asyncio.Event()
+                    shutdown_count = 0
+
+                    async def shutdown(_profile_id, _runtime, fallback=True):
+                        nonlocal shutdown_count
+                        shutdown_count += 1
+                        shutdown_entered.set()
+                        await release_shutdown.wait()
+                        return {"graceful": True, "fallback_pids": [], "remaining_processes": [], "remaining_hwnds": []}
+
+                    manager._shutdown_runtime = shutdown
+                    first = asyncio.create_task(manager.stop("Profile-10"))
+                    await asyncio.wait_for(shutdown_entered.wait(), 1)
+                    second = asyncio.create_task(manager.stop("Profile-10"))
+                    await asyncio.sleep(0)
+                    release_shutdown.set()
+                    first_result, second_result = await asyncio.wait_for(asyncio.gather(first, second), 2)
+                    self.assertEqual(shutdown_count, 1)
+                    self.assertEqual(first_result["status"], "stopped")
+                    self.assertEqual(second_result["status"], "stopped")
+                    self.assertEqual(manager._runtime, {})
+
+                asyncio.run(scenario())
+
+    def test_different_profiles_start_can_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [self._record(root, "Profile-10", "stopped"), self._record(root, "Profile-100", "stopped")]
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", return_value=[]), patch("browser_manager.profile_manager.query_profile_windows", return_value=[]):
+                manager = self._manager(root, records)
+
+                async def scenario():
+                    entered = {"Profile-10": asyncio.Event(), "Profile-100": asyncio.Event()}
+                    release = asyncio.Event()
+                    roots = {"Profile-10": 12010, "Profile-100": 12100}
+
+                    async def launch(profile_id, current_record):
+                        current_record["root_pid"] = roots[profile_id]
+                        entered[profile_id].set()
+                        await release.wait()
+                        return {"context": _FakeContext(), "browser": None, "cdp": None, "page": _FakePage(), "root_pid": roots[profile_id], "target_id": None}
+
+                    async def wait_for_processes(profile_id, present, timeout=10.0):
+                        return [{"ProcessId": roots[profile_id], "Name": "chrome.exe", "CommandLine": "synthetic"}] if present else []
+
+                    manager._launch_background_runtime = launch
+                    manager._wait_for_processes = wait_for_processes
+                    manager._monitor = lambda _profile_id: asyncio.sleep(3600)
+                    first = asyncio.create_task(manager.start("Profile-10"))
+                    second = asyncio.create_task(manager.start("Profile-100"))
+                    await asyncio.wait_for(asyncio.gather(entered["Profile-10"].wait(), entered["Profile-100"].wait()), 1)
+                    release.set()
+                    first_result, second_result = await asyncio.wait_for(asyncio.gather(first, second), 2)
+                    self.assertEqual(first_result["status"], "running")
+                    self.assertEqual(second_result["status"], "running")
+                    self.assertEqual(set(manager._runtime), {"Profile-10", "Profile-100"})
+                    await asyncio.gather(manager.stop("Profile-10"), manager.stop("Profile-100"))
+
+                asyncio.run(scenario())
+
+    def test_recovery_required_concurrent_starts_remain_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root, "Profile-10", "error")
+            record["last_error"] = "recovery_required:live_profile_processes"
+            process = {"ProcessId": 12014, "Name": "chrome.exe", "CommandLine": "synthetic"}
+            with patch("browser_manager.profile_manager.query_profile_processes_strict", return_value=[process]):
+                manager = self._manager(root, [record])
+
+                async def scenario():
+                    launch = AsyncMock()
+                    manager._launch_background_runtime = launch
+                    results = await asyncio.gather(
+                        manager.start("Profile-10"),
+                        manager.start("Profile-10"),
+                        return_exceptions=True,
+                    )
+                    self.assertTrue(all(isinstance(result, ProfileManagerError) for result in results))
+                    self.assertEqual(launch.await_count, 0)
+                    self.assertEqual(manager.get("Profile-10")["status"], "error")
+                    self.assertEqual(manager.get("Profile-10")["last_error"], "recovery_required:live_profile_processes")
+
+                asyncio.run(scenario())
 
     def test_same_data_dir_is_exclusive_across_processes_and_releases(self):
         context = multiprocessing.get_context("spawn")

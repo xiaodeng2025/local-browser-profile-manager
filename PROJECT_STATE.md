@@ -112,6 +112,27 @@ fail-safe、人工清理后的严格空探测 reconciliation，以及恢复正�
 `recovery_required`，用户人工关闭 orphan 后，严格探测确认为空才恢复 `stopped`。
 新 Manager 直接 `stop()` orphan 当前不支持，不作为 Fix Unit 1 blocker。
 
+## Fix Unit 2 checkpoint：per-profile lifecycle serialization（2026-08-24）
+
+在保持 Fix Unit 1 `recovery_required`、orphan 和严格进程匹配语义不变的前提下，
+ProfileManager 已为每个 `profile_id` 增加独立的 `asyncio.Lock`：
+
+- 同一 Profile 的 `start()`、`stop()`、`restart()` 串行执行；
+- `restart()` 使用内部 unlocked helper，避免持锁后重复获取同一把锁造成死锁；
+- 不同 Profile 使用不同锁，生命周期操作保持并行；
+- `start_many()`、`stop_all()` 继续通过公开生命周期入口，保持 per-profile 锁语义；
+- recovery Profile 在并发调用下仍不能启动。
+
+验证结果：reliability tests 22/22 通过；全量 unit tests 27/27 通过；
+`git diff --check` 通过。Windows Chromium 实机并发验收全部通过：同 Profile
+并发 start/start、start/stop、restart/start、stop/stop、不同 Profile 并行启动、
+recovery_required 并发保护均无死锁、无重复 root Chrome；Monitor 未纳入
+lifecycle lock，但本轮未观察到状态覆盖、假 `browser_process_disappeared` 或
+无法恢复的 Registry/PID 不一致。
+
+完整 lifecycle 状态机、Monitor tri-state、ProcessObserver 和其他架构加固仍为
+Deferred；Fix Unit 2 不扩大为这些后续工作。
+
 ## v0.1 冻结维护状态
 
 公开仓库 v0.1 定位为本地人工操作冻结版：本地运行、多 Profile 隔离、人工打开
@@ -125,7 +146,7 @@ fail-safe、人工清理后的严格空探测 reconciliation，以及恢复正�
 
 以下审计项保留为 `Known Issues / Deferred Hardening`，本冻结版不继续处理：
 
-- Profile 生命周期并发状态机；
+- 完整 Profile 生命周期状态机；当前已完成 per-profile lifecycle serialization；
 - Manager 重启后的自动 CDP reconnect、孤儿 Chrome 的自动接管或自动终止；当前
   仅支持 fail-safe 检测、`recovery_required` 和人工清理后的 reconciliation；
 - ProcessObserver、重复 PowerShell/CIM 扫描和监控开销；
@@ -140,9 +161,9 @@ fail-safe、人工清理后的严格空探测 reconciliation，以及恢复正�
 
 ## 遗留风险
 
-本单元没有修改生命周期状态机、Manager 自动恢复、重复 PowerShell 扫描、
-ProcessObserver、Page Lock、UI 或其他审查项。默认 Monitor 仍使用原有的
-空列表错误语义；只有 Manager 启动和 `start()` 前的安全预检使用严格失败语义。
+本单元没有实现完整生命周期状态机、Manager 自动恢复、重复 PowerShell 扫描、
+ProcessObserver、Page Lock、UI 或其他审查项。Monitor 没有纳入 lifecycle lock，
+仍使用原有的空列表错误语义；本轮实机未观察到它干扰 lifecycle。
 
 当前 fail-safe 不会终止或接管 orphan Chrome；用户仍需人工处理 orphan，随后
 由 Manager 通过新的严格空探测解除 recovery。若 Manager 重启时其他 Profile
