@@ -30,6 +30,10 @@ class ProfileManagerError(RuntimeError):
     pass
 
 
+class ProfileProcessProbeError(RuntimeError):
+    pass
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -95,8 +99,8 @@ def foreground_snapshot() -> dict[str, int]:
     return {"hwnd": hwnd, "pid": int(pid.value)}
 
 
-def query_profile_processes(user_data_dir: Path) -> list[dict[str, Any]]:
-    """Return Chrome processes whose parsed user-data-dir equals this Profile."""
+def _query_profile_processes(user_data_dir: Path, *, strict: bool) -> list[dict[str, Any]]:
+    """Query Chrome processes, optionally failing closed on probe errors."""
     command = (
         "$items=@(Get-CimInstance Win32_Process | Where-Object "
         "{$_.Name -eq 'chrome.exe' -and $_.CommandLine} | "
@@ -121,8 +125,20 @@ def query_profile_processes(user_data_dir: Path) -> list[dict[str, Any]]:
             item for item in value
             if isinstance(item, dict) and profile_process_matches(str(item.get("CommandLine", "")), user_data_dir)
         ]
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise ProfileProcessProbeError(f"profile_process_probe_failed:{type(exc).__name__}: {exc}") from exc
         return []
+
+
+def query_profile_processes(user_data_dir: Path) -> list[dict[str, Any]]:
+    """Return Chrome processes while preserving the legacy empty-list behavior."""
+    return _query_profile_processes(user_data_dir, strict=False)
+
+
+def query_profile_processes_strict(user_data_dir: Path) -> list[dict[str, Any]]:
+    """Return Chrome processes or raise when the startup safety probe fails."""
+    return _query_profile_processes(user_data_dir, strict=True)
 
 
 def query_profile_windows(user_data_dir: Path) -> list[int]:
@@ -192,7 +208,27 @@ class ProfileManager:
                 record["network"] = normalize_network_config(record.get("network"))
             except ValueError as exc:
                 raise ProfileManagerError(f"invalid_network_config:{record.get('id', '?')}:{exc}") from exc
-            if record.get("status") in {"starting", "running", "stopping"}:
+            try:
+                processes = query_profile_processes_strict(Path(record["user_data_dir"]))
+            except ProfileProcessProbeError as exc:
+                record.update({
+                    "status": "error",
+                    "process_ids": [],
+                    "last_error": f"recovery_required:process_probe_failed:{exc}",
+                    "startup_stage": "error",
+                })
+                continue
+            if processes:
+                record.update({
+                    "status": "error",
+                    "process_ids": [p["ProcessId"] for p in processes if str(p.get("ProcessId", "")).isdigit()],
+                    "last_error": "recovery_required:live_profile_processes",
+                    "startup_stage": "error",
+                })
+                continue
+            if record.get("status") == "error" and str(record.get("last_error", "")).startswith("recovery_required:"):
+                self._clear_recovery_state(record)
+            elif record.get("status") in {"starting", "running", "stopping"}:
                 record["status"] = "stopped"
                 record["process_ids"] = []
                 record["last_error"] = "manager_restarted"
@@ -319,6 +355,40 @@ class ProfileManager:
 
     def _count_starting_or_running(self) -> int:
         return sum(item.get("status") in {"starting", "running"} for item in self._records.values())
+
+    def _mark_recovery_required(self, record: dict[str, Any], error: str, processes: list[dict[str, Any]] | None = None) -> None:
+        record.update({
+            "status": "error",
+            "process_ids": [p["ProcessId"] for p in (processes or []) if str(p.get("ProcessId", "")).isdigit()],
+            "last_error": error,
+            "startup_stage": "error",
+        })
+
+    def _clear_recovery_state(self, record: dict[str, Any]) -> None:
+        record.update({
+            "status": "stopped",
+            "last_error": None,
+            "process_ids": [],
+            "root_pid": None,
+            "debug_endpoint": None,
+            "project_hwnds": [],
+            "target_id": None,
+            "startup_stage": "stopped",
+        })
+
+    async def _ensure_profile_processes_absent(self, record: dict[str, Any]) -> None:
+        try:
+            processes = await asyncio.to_thread(query_profile_processes_strict, Path(record["user_data_dir"]))
+        except ProfileProcessProbeError as exc:
+            error = f"recovery_required:process_probe_failed:{exc}"
+            self._mark_recovery_required(record, error)
+            self._save()
+            raise ProfileManagerError(error) from exc
+        if processes:
+            error = "recovery_required:live_profile_processes"
+            self._mark_recovery_required(record, error, processes)
+            self._save()
+            raise ProfileManagerError(error)
 
     async def _wait_for_processes(self, profile_id: str, present: bool, timeout: float = 10.0) -> list[dict[str, Any]]:
         record = self._records[profile_id]
@@ -493,6 +563,12 @@ class ProfileManager:
             raise ProfileManagerError(f"unknown profile: {profile_id}")
         if record.get("status") == "running":
             return dict(record)
+        if str(record.get("last_error", "")).startswith("recovery_required:"):
+            await self._ensure_profile_processes_absent(record)
+            self._clear_recovery_state(record)
+            self._save()
+        else:
+            await self._ensure_profile_processes_absent(record)
         if self._count_starting_or_running() >= self.soft_concurrency_limit:
             record["last_error"] = f"soft_concurrency_limit_reached:{self.soft_concurrency_limit}"
             self._save()

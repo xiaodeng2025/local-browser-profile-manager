@@ -48,6 +48,70 @@ Profile，没有个人账号、Cookie、真实业务数据、真实网站或网�
 Google Chrome 特定版本尚未单独验收；本次结果证明的是实际 Chromium 与当前
 Windows named mutex、命令行解析和 Profile 隔离链路。
 
+## 当前冻结维护修复单元：Manager 重启孤儿 Chrome fail-safe（2026-08-24）
+
+本单元只处理 Manager 重启后 Registry 与真实 Chrome Profile 进程不一致的
+安全边界，不实现自动恢复、自动杀进程或 CDP 接管：
+
+- Manager 启动时对每个 Profile 做严格的 `--user-data-dir` 进程探测；发现仍有
+  对应 Chrome，或探测本身失败时，记录 `status=error`、
+  `last_error=recovery_required:*` 和可诊断的进程信息；
+- `start(profile_id)` 在启动任何 Chrome 前再次做严格预检；发现 live Chrome
+  或探测失败即拒绝启动；
+- Registry 中的 `running`、`starting`、`stopping` 只有在确认没有对应 live
+  Chrome 时才按原逻辑归一为 `stopped`；`stopped + live Chrome` 也会进入
+  `error/recovery_required`，不会静默允许重复启动；
+- 保持普通 stopped/no-process 的启动路径和现有 API 结构不变；保留默认进程
+  查询函数的既有行为，不在本单元改造全局 Monitor/process-probe 语义。
+
+验证：新增 5 个孤儿/预检决策单元测试；可靠性专项测试 10/10 通过；全量
+unit tests 15/15 通过；未启动服务、Chrome 或网络，未提交 commit。真实
+Windows Chrome/Chromium Manager 重启验收仍待执行。
+
+## recovery_required 闭环补丁（2026-08-24）
+
+Windows 实机验收发现：orphan Chrome 清理后，Registry 中的
+`error + recovery_required` 会永久阻止 `start()`。本补丁保持 fail-safe 语义，
+但把 recovery 状态解释为“需要重新确认的当前状态”：
+
+- Manager `_load()` 或 `start()` 对 recovery Profile 重新执行严格
+  `user-data-dir` 进程探测；
+- 仍有 live Chrome 时继续保持 `error/recovery_required`，更新实际
+  `process_ids`，不自动 kill 或 connect/recover；
+- 严格探测成功且为空时，清空旧 PID、root PID、CDP endpoint、窗口句柄和
+  target 元数据，恢复为 `stopped`，随后允许普通 start；
+- 严格探测失败时保持 fail-safe，并记录明确的
+  `recovery_required:process_probe_failed`。
+
+根因修复单元测试覆盖 6 个场景；可靠性专项测试 16/16 通过；全量 unit tests
+21/21 通过；`git diff --check` 通过。
+
+## Fix Unit 1 第二次 Windows 实机验收（2026-08-24）
+
+使用全新临时 data-dir、Profile-10、Profile-100 和 Playwright Chromium
+151.0.7922.34，仅访问本地 ready page，未使用个人账号、Cookie 或真实网站。
+
+通过项目目标范围内的验收：
+
+- Manager 被强制结束后，Profile-10 Chrome root PID 仍存活；
+- 重启 Manager 后 live Profile 被标记为
+  `error/recovery_required:live_profile_processes`，实际 `process_ids` 被记录；
+- 再次 start 被拒绝，未产生第二套同 `user-data-dir` root Chrome；
+- Profile-100 可独立启动，两个 Profile 的 PID 集合不交叉；
+- 人工结束 Profile-10 orphan 后，严格探测为空，Profile-100 仍继续运行；
+- 不修改 Registry 重启 Manager 后，Profile-10 reconciliation 为完整的
+  `stopped` 状态并清空旧运行元数据；
+- Profile-10 重新启动成功，产生不同于旧 orphan 的新 root PID；
+- 两个 Profile 的进程识别保持精确隔离。
+
+因此，Fix Unit 1 按重新界定的范围满足关闭条件：检测 orphan、禁止重复启动、
+fail-safe、人工清理后的严格空探测 reconciliation，以及恢复正常 start。
+
+明确不属于本单元关闭条件的行为：Manager 重启后仍存活的 Chrome 属于 orphan；
+新 Manager 不自动 CDP reconnect、不自动接管、不自动 kill。此时只能进入
+`recovery_required`，用户人工关闭 orphan 后，严格探测确认为空才恢复 `stopped`。
+新 Manager 直接 `stop()` orphan 当前不支持，不作为 Fix Unit 1 blocker。
+
 ## v0.1 冻结维护状态
 
 公开仓库 v0.1 定位为本地人工操作冻结版：本地运行、多 Profile 隔离、人工打开
@@ -62,23 +126,32 @@ Windows named mutex、命令行解析和 Profile 隔离链路。
 以下审计项保留为 `Known Issues / Deferred Hardening`，本冻结版不继续处理：
 
 - Profile 生命周期并发状态机；
-- Manager 重启后的自动恢复和孤儿 Chrome 识别；
+- Manager 重启后的自动 CDP reconnect、孤儿 Chrome 的自动接管或自动终止；当前
+  仅支持 fail-safe 检测、`recovery_required` 和人工清理后的 reconciliation；
 - ProcessObserver、重复 PowerShell/CIM 扫描和监控开销；
 - Default Page 与显式 Page ID 的统一锁；
 - Page event postcondition 的跨 Page 归属；
 - Basic Proxy UI、停止后的 pageCache、导航输入校验；
 - 下载同名覆盖、下载哈希内存占用、截图文件名碰撞。
+- Manager 重启后对仍存活 orphan 的直接 `stop()`；
+- lifecycle HTTP 200 但返回 Profile `status=error` 的 API 语义统一。
 
 除非出现新的安全、数据隔离或明确严重缺陷，不开启下一修复阶段。
 
 ## 遗留风险
 
-本单元没有修改生命周期状态机、Manager 重启恢复、进程探测失败语义、重复
-PowerShell 扫描、ProcessObserver、Page Lock、UI 或其他审查项。
+本单元没有修改生命周期状态机、Manager 自动恢复、重复 PowerShell 扫描、
+ProcessObserver、Page Lock、UI 或其他审查项。默认 Monitor 仍使用原有的
+空列表错误语义；只有 Manager 启动和 `start()` 前的安全预检使用严格失败语义。
 
-named mutex 阻止的是第二个 Manager；如果 Manager 异常退出但 Chrome 仍存活，
-后续 Manager 的 Registry 与实际 Chrome 状态不一致问题仍未处理。Google Chrome
-而非 bundled Chromium 的版本差异也尚未单独验收。
+当前 fail-safe 不会终止或接管 orphan Chrome；用户仍需人工处理 orphan，随后
+由 Manager 通过新的严格空探测解除 recovery。若 Manager 重启时其他 Profile
+也仍有 live Chrome，这些 Profile 同样会成为 orphan；新 Manager 不会为其建立
+runtime，因此直接 `stop()` 可能返回 HTTP 200 但 Profile 状态为 `error` 且仍有
+`profile_processes_remain`。这属于明确限制和 Deferred API 语义问题。
+
+启动时对所有 Profile 的同步严格探测可能增加 Manager 启动延迟；PowerShell/CIM
+真实失败会保守地阻止该 Profile 启动。
 
 ## 下一步
 
