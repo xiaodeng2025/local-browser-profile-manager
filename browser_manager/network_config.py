@@ -1,9 +1,8 @@
 """Per-Profile fixed-network configuration for the local browser manager.
 
 The first product slice deliberately supports only direct connections and a
-single fixed, credential-free proxy endpoint.  Chromium does not consume
-credentials embedded in a manual ``--proxy-server`` setting, so accepting
-username/password fields here would create a misleading and unsafe UI.
+single fixed proxy endpoint. Credentials are kept outside this module and are
+handled by the ProfileManager's proxy-authentication path.
 """
 from __future__ import annotations
 

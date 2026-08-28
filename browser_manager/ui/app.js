@@ -133,6 +133,11 @@
     return `固定代理 · ${(network.scheme || "").toUpperCase()}${network.authentication === "basic" ? " · 账号认证" : ""}`;
   }
 
+  function fingerprintLabel(fingerprint) {
+    if (!fingerprint || fingerprint.mode !== "fixed") return "未启用";
+    return fingerprint.engine === "locked" ? "固定 / 浏览器版本已锁定" : "固定 / 待首次启动锁定";
+  }
+
   function renderProfile(profile) {
     const meta = settings[profile.id] || { display_name: profile.name || profile.id, color: "#2563eb", note: "", shortcuts: [] };
     const network = profile.network || { mode: "direct" };
@@ -147,6 +152,7 @@
     const pages = pageCache.get(profile.id) || [];
     card.querySelector(".page-count").textContent = `${pages.length} 个`;
     card.querySelector(".network-status").textContent = networkLabel(network);
+    card.querySelector(".fingerprint-status").textContent = fingerprintLabel(profile.fingerprint);
     renderPages(card, pages);
     const form = card.querySelector(".settings-form");
     form.display_name.value = meta.display_name; form.color.value = meta.color; form.note.value = meta.note || "";

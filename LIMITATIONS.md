@@ -1,6 +1,6 @@
-# v0.1 limitations
+# Public-R1 limitations
 
-The public v0.1 scope is a local manual multi-profile manager.
+The Public-R1 scope remains a local manual multi-profile manager.
 
 Not included or guaranteed:
 
@@ -9,7 +9,16 @@ Not included or guaranteed:
   injection;
 - proxy pools, automatic IP rotation, geographic routing, PAC, DNS, WebRTC,
   or proof that a proxy exit differs from direct routing;
-- fingerprint spoofing or identity persistence across arbitrary browser builds;
+- SOCKS5 username/password authentication. Basic credentials are accepted only
+  for a single fixed HTTP or HTTPS proxy;
+- proof that an authenticated proxy works with a particular provider, browser
+  build, network, or target website;
+- fingerprint spoofing, anti-detection, target-site acceptance, or identity
+  persistence across arbitrary browser builds. A fixed seed is only supplied
+  as a stable launch input to a compatible browser executable;
+- automatic migration after the locked browser executable changes. The start
+  fails closed on an executable digest mismatch, and the seed or digest is not
+  returned by the management API or displayed by the management page;
 - real-site business workflows, CAPTCHA handling, or login compatibility across
   all platforms;
 - background focus stability. Hidden mode remains experimental and disabled by

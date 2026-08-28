@@ -65,6 +65,7 @@ class ReliabilityHardeningTests(unittest.TestCase):
 
     def _manager(self, root: Path, records: list[dict]) -> ProfileManager:
         registry = root / "registry.json"
+        (root / "chrome.exe").write_bytes(b"unit-test-browser")
         registry.write_text(json.dumps({"version": 1, "profiles": records}), encoding="utf-8")
         return ProfileManager(
             object(),
