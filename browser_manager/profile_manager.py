@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import hashlib
 import json
 import os
 import shlex
@@ -20,6 +21,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from .fingerprint_config import (
+    fingerprint_launch_args,
+    new_fixed_fingerprint,
+    normalize_fingerprint,
+    public_fingerprint_status,
+    without_fingerprint_arguments,
+)
 from .network_config import normalize_network_config, proxy_launch_args, without_proxy_arguments
 from .permission_manager import PermissionPolicyError
 
@@ -218,7 +226,20 @@ class ProfileManager:
         if self.registry_path.exists():
             data = json.loads(self.registry_path.read_text(encoding="utf-8"))
             self._records = {item["id"]: item for item in data.get("profiles", [])}
+        existing_seeds: set[int] = set()
         for record in self._records.values():
+            fingerprint = record.get("fingerprint")
+            if fingerprint is None:
+                record["fingerprint"] = new_fixed_fingerprint(existing_seeds)
+            else:
+                try:
+                    record["fingerprint"] = normalize_fingerprint(fingerprint)
+                except ValueError as exc:
+                    raise ProfileManagerError(f"invalid_fingerprint:{record.get('id', '?')}:{exc}") from exc
+            seed = record["fingerprint"]["seed"]
+            if seed in existing_seeds:
+                raise ProfileManagerError(f"duplicate_fingerprint_seed:{record.get('id', '?')}")
+            existing_seeds.add(seed)
             try:
                 record["network"] = normalize_network_config(record.get("network"))
             except ValueError as exc:
@@ -257,12 +278,36 @@ class ProfileManager:
         os.replace(temp, self.registry_path)
 
     def list(self) -> list[dict[str, Any]]:
-        return [dict(item) for item in self._records.values()]
+        return [self._public_status_record(item) for item in self._records.values()]
 
     def get(self, profile_id: str) -> dict[str, Any]:
         if profile_id not in self._records:
             raise ProfileManagerError(f"unknown profile: {profile_id}")
-        return dict(self._records[profile_id])
+        return self._public_status_record(self._records[profile_id])
+
+    @staticmethod
+    def _fingerprint_engine_sha256(executable: str) -> str:
+        digest = hashlib.sha256()
+        with open(executable, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _ensure_fingerprint_engine(self, record: dict[str, Any]) -> None:
+        fingerprint = record["fingerprint"]
+        actual = self._fingerprint_engine_sha256(record["browser_executable"])
+        expected = fingerprint["engine_sha256"]
+        if expected is None:
+            fingerprint["engine_sha256"] = actual
+            self._save()
+        elif expected != actual:
+            raise ProfileManagerError("fingerprint_engine_hash_mismatch")
+
+    @staticmethod
+    def _public_status_record(record: dict[str, Any]) -> dict[str, Any]:
+        result = dict(record)
+        result["fingerprint"] = public_fingerprint_status(record["fingerprint"])
+        return result
 
     def context_for(self, profile_id: str) -> Any:
         record = self._records.get(profile_id)
@@ -299,10 +344,13 @@ class ProfileManager:
             # Direct means this Profile explicitly does not use a Chromium
             # application proxy. It does not override operating-system routes.
             "network": {"mode": "direct"},
+            "fingerprint": new_fixed_fingerprint(
+                {item["fingerprint"]["seed"] for item in self._records.values()}
+            ),
         }
         self._records[profile_id] = record
         self._save()
-        return dict(record)
+        return self._public_status_record(record)
 
     def configure_network(self, profile_id: str, value: dict[str, Any]) -> dict[str, Any]:
         """Persist the next-start network route for one stopped Profile only."""
@@ -316,18 +364,21 @@ class ProfileManager:
         except ValueError as exc:
             raise ProfileManagerError(str(exc)) from exc
         self._save()
-        return dict(record)
+        return self._public_status_record(record)
 
     def _browser_args_for(self, record: dict[str, Any]) -> list[str]:
-        """Make the per-Profile route override any accidental global proxy arg."""
-        return [*without_proxy_arguments(self.browser_args), *proxy_launch_args(record["network"])]
+        """Make Profile network and fingerprint settings override global arguments."""
+        base = without_fingerprint_arguments(without_proxy_arguments(self.browser_args))
+        return [
+            *base,
+            *proxy_launch_args(record["network"]),
+            *fingerprint_launch_args(record["fingerprint"]),
+        ]
 
     def _proxy_credentials_for(self, profile_id: str, record: dict[str, Any]) -> dict[str, str] | None:
         network = record["network"]
         if network.get("authentication") != "basic":
             return None
-        if not self.background_mode:
-            raise ProfileManagerError("proxy_basic_authentication_requires_background_mode")
         if self.proxy_credentials is None:
             raise ProfileManagerError("proxy_credentials_store_unavailable")
         try:
@@ -338,12 +389,26 @@ class ProfileManager:
             raise ProfileManagerError("proxy_credentials_missing")
         return credentials
 
+    def _persistent_proxy_for(self, profile_id: str, record: dict[str, Any]) -> dict[str, str] | None:
+        """Build a Playwright launch-time proxy without putting credentials in browser arguments."""
+        network = record["network"]
+        if network.get("mode") != "fixed" or network.get("authentication") != "basic":
+            return None
+        credentials = self._proxy_credentials_for(profile_id, record)
+        if credentials is None:
+            raise ProfileManagerError("proxy_credentials_missing")
+        return {
+            "server": f"{network['scheme']}://{network['host']}:{network['port']}",
+            "username": credentials["username"],
+            "password": credentials["password"],
+        }
+
     async def _configure_proxy_auth_handler(self, cdp: Any, credentials: dict[str, str] | None) -> set[asyncio.Task[Any]]:
         """Answer only proxy auth challenges; never inject credentials into sites."""
         tasks: set[asyncio.Task[Any]] = set()
         if credentials is None:
             return tasks
-        await cdp.send("Fetch.enable", {"patterns": [], "handleAuthRequests": True})
+        await cdp.send("Fetch.enable", {"handleAuthRequests": True})
 
         async def continue_auth(event: dict[str, Any]) -> None:
             challenge = event.get("authChallenge") if isinstance(event, dict) else None
@@ -615,7 +680,7 @@ class ProfileManager:
         if record is None:
             raise ProfileManagerError(f"unknown profile: {profile_id}")
         if record.get("status") == "running":
-            return dict(record)
+            return self._public_status_record(record)
         if str(record.get("last_error", "")).startswith("recovery_required:"):
             await self._ensure_profile_processes_absent(record)
             self._clear_recovery_state(record)
@@ -636,14 +701,18 @@ class ProfileManager:
             runtime: dict[str, Any] | None = None
             context = None
             try:
+                self._ensure_fingerprint_engine(record)
                 browser_args = self._browser_args_for(record)
-                if not self.background_mode:
+                persistent_proxy = self._persistent_proxy_for(profile_id, record)
+                if not self.background_mode or persistent_proxy is not None:
+                    launch_args = without_proxy_arguments(browser_args) if persistent_proxy is not None else browser_args
                     context = await self.playwright.chromium.launch_persistent_context(
                         user_data_dir=record["user_data_dir"],
                         executable_path=record["browser_executable"],
                         headless=False,
                         viewport={"width": 1280, "height": 720},
-                        args=["--no-first-run", "--no-default-browser-check", *browser_args],
+                        args=["--no-first-run", "--no-default-browser-check", *launch_args],
+                        proxy=persistent_proxy,
                     )
                     page = context.pages[0] if context.pages else await context.new_page()
                     runtime = {"context": context, "browser": None, "cdp": None, "page": page, "root_pid": None, "target_id": None, "endpoint": None}
@@ -651,7 +720,15 @@ class ProfileManager:
                     runtime = await self._launch_background_runtime(profile_id, record)
                     context = runtime["context"]
                     page = runtime["page"]
-                await page.goto(self.ready_url, wait_until="domcontentloaded", timeout=self.ready_timeout_ms)
+                ready_url = self.ready_url
+                fixed_network = record["network"].get("mode") == "fixed"
+                if fixed_network:
+                    # Do not route the Manager's local readiness request through
+                    # an external per-Profile proxy.
+                    ready_url = "about:blank"
+                await page.goto(ready_url, wait_until="domcontentloaded", timeout=self.ready_timeout_ms)
+                if fixed_network and self.ready_title is not None:
+                    await page.evaluate("title => { document.title = title; }", self.ready_title)
                 title = await page.title()
                 await page.evaluate("() => document.readyState")
                 if self.ready_title is not None and title != self.ready_title:
@@ -659,7 +736,15 @@ class ProfileManager:
                 processes = await self._wait_for_processes(profile_id, True)
                 if not processes:
                     raise ProfileManagerError("browser_process_not_observed")
+                if runtime.get("root_pid") is None:
+                    root_candidates = [
+                        int(item["ProcessId"])
+                        for item in processes
+                        if "--type=" not in str(item.get("CommandLine", ""))
+                    ]
+                    runtime["root_pid"] = root_candidates[0] if root_candidates else int(processes[0]["ProcessId"])
                 record["project_hwnds"] = query_profile_windows(Path(record["user_data_dir"]))
+                record["root_pid"] = runtime.get("root_pid")
                 record["target_id"] = runtime.get("target_id") if runtime else None
                 record.update({
                     "status": "running",
@@ -672,7 +757,7 @@ class ProfileManager:
                 monitor = asyncio.create_task(self._monitor(profile_id))
                 runtime.update({"monitor": monitor, "expected_stop": False})
                 self._runtime[profile_id] = runtime
-                return dict(record)
+                return self._public_status_record(record)
             except ProfileProcessProbeError as exc:
                 last_error = self._process_probe_error(exc)
                 record["last_error"] = last_error
@@ -771,7 +856,7 @@ class ProfileManager:
             except ProfileProcessProbeError as exc:
                 record["last_error"] = self._process_probe_error(exc)
                 self._save()
-                return dict(record)
+                return self._public_status_record(record)
             if processes and str(record.get("last_error", "")).startswith("process_probe_failed:"):
                 record["last_error"] = None
                 self._save()
@@ -785,7 +870,7 @@ class ProfileManager:
                         pass
                 record.update({"status": "error", "process_ids": [], "last_error": "browser_process_disappeared"})
                 self._save()
-        return dict(record)
+        return self._public_status_record(record)
 
     async def stop(self, profile_id: str) -> dict[str, Any]:
         if profile_id not in self._records:
@@ -798,7 +883,7 @@ class ProfileManager:
         if record is None:
             raise ProfileManagerError(f"unknown profile: {profile_id}")
         if record.get("status") == "stopped":
-            return dict(record)
+            return self._public_status_record(record)
         record["status"] = "stopping"
         self._save()
         runtime = self._runtime.pop(profile_id, None)
@@ -819,7 +904,7 @@ class ProfileManager:
                 record.update({"status": "error", "last_error": error, "startup_stage": "error"})
                 record["last_cleanup"] = {"graceful": False, "probe_error": error, "fallback_pids": [], "remaining_processes": self._record_process_ids(record), "remaining_hwnds": []}
                 self._save()
-                return dict(record)
+                return self._public_status_record(record)
         try:
             processes = query_profile_processes(Path(record["user_data_dir"]))
         except ProfileProcessProbeError as exc:
@@ -827,12 +912,12 @@ class ProfileManager:
             record.update({"status": "error", "last_error": error, "startup_stage": "error"})
             record["last_cleanup"] = {**cleanup, "graceful": False, "probe_error": error}
             self._save()
-            return dict(record)
+            return self._public_status_record(record)
         if cleanup.get("probe_error"):
             record.update({"status": "error", "last_error": cleanup["probe_error"], "startup_stage": "error"})
             record["last_cleanup"] = cleanup
             self._save()
-            return dict(record)
+            return self._public_status_record(record)
         if processes:
             try:
                 project_hwnds = query_profile_windows(Path(record["user_data_dir"]))
@@ -841,13 +926,13 @@ class ProfileManager:
                 record.update({"status": "error", "process_ids": [p["ProcessId"] for p in processes], "last_error": error, "startup_stage": "error"})
                 record["last_cleanup"] = {**cleanup, "graceful": False, "probe_error": error}
                 self._save()
-                return dict(record)
+                return self._public_status_record(record)
             record.update({"status": "error", "process_ids": [p["ProcessId"] for p in processes], "last_error": "profile_processes_remain", "startup_stage": "error", "project_hwnds": project_hwnds})
         else:
             record.update({"status": "stopped", "process_ids": [], "root_pid": None, "debug_endpoint": None, "startup_stage": "stopped", "project_hwnds": [], "target_id": None, "last_error": None})
         record["last_cleanup"] = cleanup
         self._save()
-        return dict(record)
+        return self._public_status_record(record)
 
     async def restart(self, profile_id: str) -> dict[str, Any]:
         if profile_id not in self._records:

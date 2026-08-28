@@ -4,12 +4,12 @@ An AI-agent-friendly local manager for manually operated Chromium browser profil
 Each profile has an independent `user-data-dir`, lifecycle, pages, optional fixed
 proxy route, and local management page.
 
-**Status: v0.1.0 · maintenance / frozen**
+**Status: Public-R1 candidate · local review branch**
 
-This release is a local, manual-operation foundation: run it locally, keep browser
-profiles isolated, and open and operate them yourself. It is not an unattended
-browser runtime, autonomous Agent system, remote service, task queue, or long-term
-automation platform.
+This release candidate keeps the v0.1 local, manual-operation foundation: run it
+locally, keep browser profiles isolated, and open and operate them yourself. It is
+not an unattended browser runtime, autonomous Agent system, remote service, task
+queue, or long-term automation platform.
 
 ## Scope
 
@@ -20,6 +20,22 @@ pool, task queue, or autonomous website agent.
 The service binds to `127.0.0.1` and requires the user to provide a local
 Chrome/Chromium executable. Browser binaries and profile data are not bundled.
 
+Public-R1 adds two narrowly scoped local capabilities:
+
+- a stopped Profile may use one fixed HTTP or HTTPS proxy with Basic
+  authentication. Credentials remain in the existing local Windows-protected
+  secret store and are supplied at persistent browser launch; they are not put
+  in browser command-line arguments or returned by the management API;
+- every Profile receives one persisted fixed fingerprint seed. The management
+  page exposes only whether the configuration is fixed and whether the browser
+  executable version has been locked. It never returns the seed or executable
+  digest.
+
+The fixed seed is only a stable launch input for a compatible browser build. It
+does not prove that a browser consumes the argument, that a target website will
+allow the Profile, or that the Profile is resistant to detection. It also does
+not provide geographic or network isolation.
+
 ## Important limitations
 
 - Profile data may contain cookies, login sessions, saved passwords, history,
@@ -28,8 +44,12 @@ Chrome/Chromium executable. Browser binaries and profile data are not bundled.
   account as the trust boundary.
 - Hidden-window operation is experimental and disabled by default. No guarantee
   is made that a headed browser will never take foreground focus.
-- Real-site compatibility, proxy exit separation, geographic routing, and
-  authenticated proxy operation are not guaranteed by v0.1.
+- Real-site compatibility, target-site acceptance, proxy exit separation,
+  geographic routing, and authenticated proxy operation are not guaranteed.
+- SOCKS5 username/password authentication is not supported.
+- A browser executable change after the first fingerprint-enabled start is
+  rejected until the local Profile state is deliberately migrated; Public-R1
+  does not provide an automatic migration workflow.
 
 See [`SECURITY.md`](SECURITY.md), [`LIMITATIONS.md`](LIMITATIONS.md), and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) before running it with a
