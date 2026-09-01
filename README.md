@@ -36,6 +36,18 @@ does not prove that a browser consumes the argument, that a target website will
 allow the Profile, or that the Profile is resistant to detection. It also does
 not provide geographic or network isolation.
 
+The v0.1 startup and data-safety path also provides:
+
+- manual Profiles start as ordinary visible Chromium processes by default;
+  the service does not attach over CDP or expose Playwright pages for that
+  runtime. Automation requests fail with `automation_not_attached`;
+- Chromium's native download preferences are set per Profile. Completed
+  downloads are accepted only when Chromium reports a final file inside that
+  Profile's own download directory;
+- the default product ports accept only the canonical `profile-data` root with
+  its reviewed non-sensitive marker. Random ports remain available for
+  isolated local tests.
+
 ## Important limitations
 
 - Profile data may contain cookies, login sessions, saved passwords, history,
@@ -50,6 +62,8 @@ not provide geographic or network isolation.
 - A browser executable change after the first fingerprint-enabled start is
   rejected until the local Profile state is deliberately migrated; Public-R1
   does not provide an automatic migration workflow.
+- Native manual startup intentionally has no Playwright page automation or CDP
+  attachment; it is a user-operated browser mode.
 
 See [`SECURITY.md`](SECURITY.md), [`LIMITATIONS.md`](LIMITATIONS.md), and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) before running it with a

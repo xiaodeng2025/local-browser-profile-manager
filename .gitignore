@@ -2,8 +2,11 @@
 __pycache__/
 *.py[cod]
 local-data/
+profile-data/
 runtime/
 validation/
+downloads/
+screenshots/
 tests/.artifacts/
 *.log
 *.jsonl

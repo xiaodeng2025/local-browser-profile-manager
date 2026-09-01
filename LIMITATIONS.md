@@ -37,6 +37,11 @@ Not included or guaranteed:
   in v0.1. The lifecycle API may return HTTP 200 while the returned Profile
   remains `status=error` with `profile_processes_remain`; this API semantic is
   deferred and is not part of Fix Unit 1.
+- Native downloads are constrained to the Profile-specific directory reported
+  by Chromium. This does not provide duplicate-name policy or recovery of a
+  file that a user moves afterward.
+- Manual native Profiles do not expose Playwright page automation or CDP
+  attachment; automation endpoints return `automation_not_attached`.
 
 Any future expansion requires a new threat model, explicit acceptance criteria,
 and separate approval.

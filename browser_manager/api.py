@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .network_config import normalize_network_config
+from .downloads import DownloadTrackingError
 from .profile_manager import ProfileManager, ProfileManagerError, query_profile_processes
 
 
@@ -793,16 +794,17 @@ class LocalProfileAPI:
                         except LocatorResolutionError as exc:
                             return (400 if exc.code == "invalid_request" else 422), {**self._error(exc.code, str(exc), profile_id), "locator_attempts": exc.attempts}, profile_id, "error"
                         selector = data.get("selector") or data.get("locator") or data.get("locators")
+                        download_manager = self.manager.download_manager_for(profile_id)
+                        marker = download_manager.observation_marker()
                         async with page.expect_download(timeout=timeout) as download_info:
                             await target.click(timeout=timeout)
                         download = await download_info.value
-                        destination_dir = self.download_root / profile_id
-                        destination_dir.mkdir(parents=True, exist_ok=True)
-                        filename = Path(download.suggested_filename).name
-                        destination = destination_dir / filename
-                        await download.save_as(str(destination))
+                        result = await download_manager.wait_for_download(download, marker, timeout / 1000)
+                        destination = Path(result["path"])
                         digest = hashlib.sha256(destination.read_bytes()).hexdigest()
-                        return 200, {"profile_id": profile_id, "selector": selector, **locator_meta, "filename": filename, "path": str(destination.resolve()), "sha256": digest, "success": True, "action_result": "executed"}, profile_id, "ok"
+                        return 200, {"profile_id": profile_id, "selector": selector, **locator_meta, **result, "sha256": digest, "action_result": "executed"}, profile_id, "ok"
+                except DownloadTrackingError as exc:
+                    return 502, self._error("download_failed", str(exc), profile_id), profile_id, "error"
                 except PlaywrightTimeoutError:
                     if action == "frame":
                         return 422, self._error("frame_not_found", "frame or element not found", profile_id), profile_id, "error"
@@ -893,6 +895,8 @@ class LocalProfileAPI:
                 return 404, self._error("profile_not_found", message, profile_id), profile_id, "error"
             if message == "profile_not_running" or message.startswith("profile is not running"):
                 return 409, self._error("profile_not_running", message, profile_id), profile_id, "error"
+            if message == "automation_not_attached":
+                return 409, self._error("automation_not_attached", "this Profile is running in native manual mode", profile_id), profile_id, "error"
             if message == "page_not_found":
                 return 404, self._error("page_not_found", message, profile_id), profile_id, "error"
             if message == "page_closed":

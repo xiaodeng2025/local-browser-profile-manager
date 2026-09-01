@@ -23,6 +23,7 @@ from typing import Any
 from playwright.async_api import async_playwright
 
 from .api import LocalProfileAPI
+from .data_root import require_safe_product_data_root
 from .instance_lock import DataDirInstanceLock
 from .local_management_ui import UISettingsStore, start_management_ui_server
 from .permission_manager import PermissionManager
@@ -66,7 +67,7 @@ def start_ready_server() -> tuple[ThreadingHTTPServer, str]:
 
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
-    data_dir = Path(args.data_dir).resolve()
+    data_dir = require_safe_product_data_root(Path(args.data_dir), api_port=args.port, ui_port=args.ui_port)
     chrome = Path(args.chrome).resolve()
     if not chrome.is_file():
         raise FileNotFoundError(f"chrome_not_found:{chrome}")
@@ -89,9 +90,15 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 ready_title="Local Profile Manager Ready",
                 soft_concurrency_limit=args.soft_concurrency_limit,
                 max_retries=2,
-                background_mode=True,
+                # V0.1 is a visible, user-operated native Chromium launch by
+                # default. Basic authenticated proxy profiles still use the
+                # retained Playwright launch path because credentials must not
+                # be placed in browser arguments.
+                background_mode=False,
+                automation_enabled=False,
                 permission_manager=PermissionManager(),
                 proxy_credentials=proxy_credentials,
+                download_root=data_dir / "downloads",
             )
             # Presentation preferences intentionally live outside registry.json.
             # Bootstrap creates only stopped records and only on the first
