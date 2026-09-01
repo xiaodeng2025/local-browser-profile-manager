@@ -13,6 +13,11 @@ canonical product data-root protection. The existing public instance lock,
 Windows-protected proxy credential store, and redacted fixed-fingerprint
 surface remain part of this repository.
 
+The canonical `profile-data` root is created with its non-sensitive marker only
+when the exact root is absent on first default-port startup. Existing unmarked
+or non-canonical roots remain rejected. The startup status uses
+`profile_startup: native_manual_default`.
+
 The branch is for review only. No public `main` change is implied until the
 tests, documentation, license notices, and sensitive-data audit are accepted.
 

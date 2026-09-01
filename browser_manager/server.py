@@ -32,6 +32,7 @@ from .proxy_secret_store import ProxyCredentialStore
 
 
 READY_HTML = b"<!doctype html><title>Local Profile Manager Ready</title><main>ready</main>"
+PROFILE_STARTUP_MODE = "native_manual_default"
 
 
 async def _http_json(host: str, port: int, method: str, path: str) -> tuple[int, dict[str, Any]]:
@@ -137,7 +138,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 "port": port,
                 "data_dir": str(data_dir),
                 "browser_executable": str(chrome),
-                "background_startup": "existing_formal_chain",
+                "profile_startup": PROFILE_STARTUP_MODE,
                 "hidden_mode": "experimental_enabled" if args.enable_experimental_hidden else "disabled_by_default_p0_1_pending",
                 "window_focus": "disabled",
                 "ui": {

@@ -54,6 +54,11 @@ def require_safe_product_data_root(data_root: Path, *, api_port: int, ui_port: i
         raise DataRootError(
             f"noncanonical_product_data_root:{resolved}; expected:{expected}; use the reviewed product launcher"
         )
+    if not resolved.exists():
+        # A fresh checkout has no ignored data directory yet. Create only the
+        # exact canonical root and its non-sensitive marker; an existing root
+        # without a marker remains rejected as a possible historical/test root.
+        initialize_canonical_data_root(resolved)
     marker = marker_path(resolved)
     try:
         stored = json.loads(marker.read_text(encoding="utf-8"))

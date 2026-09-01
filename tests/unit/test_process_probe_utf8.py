@@ -13,8 +13,7 @@ class ProcessProbeUtf8Tests(unittest.TestCase):
             profile = Path(directory) / "中文" / "Profile-01"
             output = json.dumps([{"ProcessId": 123, "Name": "chrome.exe", "CommandLine": f'chrome.exe --user-data-dir="{profile}"'}], ensure_ascii=False)
             with patch("browser_manager.profile_manager.subprocess.check_output", return_value=output) as check_output:
-                with patch("browser_manager.profile_manager.profile_process_matches", return_value=True):
-                    result = probe_profile_processes(profile)
+                result = probe_profile_processes(profile)
             self.assertEqual(result.state, "found")
             self.assertIn("中文", result.processes[0]["CommandLine"])
             command = check_output.call_args.args[0][-1]

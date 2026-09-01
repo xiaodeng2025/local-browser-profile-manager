@@ -212,7 +212,7 @@ class ProfileManager:
         monitor_interval: float = 0.5,
         browser_args: list[str] | None = None,
         background_mode: bool = True,
-        automation_enabled: bool = True,
+        automation_enabled: bool = False,
         permission_manager: Any | None = None,
         proxy_credentials: Any | None = None,
         download_root: Path | None = None,

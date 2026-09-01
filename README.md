@@ -41,12 +41,15 @@ The v0.1 startup and data-safety path also provides:
 - manual Profiles start as ordinary visible Chromium processes by default;
   the service does not attach over CDP or expose Playwright pages for that
   runtime. Automation requests fail with `automation_not_attached`;
+- the service startup status reports this mode as
+  `profile_startup: native_manual_default`;
 - Chromium's native download preferences are set per Profile. Completed
   downloads are accepted only when Chromium reports a final file inside that
   Profile's own download directory;
 - the default product ports accept only the canonical `profile-data` root with
-  its reviewed non-sensitive marker. Random ports remain available for
-  isolated local tests.
+  its reviewed non-sensitive marker. A fresh checkout creates that exact root
+  and marker on first default-port startup; an existing unmarked root is
+  rejected. Random ports remain available for isolated local tests.
 
 ## Important limitations
 
