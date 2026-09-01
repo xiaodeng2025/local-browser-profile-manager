@@ -28,6 +28,7 @@ class PublicR1Tests(unittest.TestCase):
                 ready_title="Ready",
                 max_retries=0,
                 background_mode=background_mode,
+                automation_enabled=True,
                 proxy_credentials=_Credentials(),
             )
 
@@ -102,6 +103,7 @@ class PublicR1AsyncTests(unittest.IsolatedAsyncioTestCase):
                     ready_title="Ready",
                     max_retries=0,
                     background_mode=True,
+                    automation_enabled=True,
                     proxy_credentials=_Credentials(),
                 )
             manager.create("Profile-01")

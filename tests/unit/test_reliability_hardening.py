@@ -74,6 +74,7 @@ class ReliabilityHardeningTests(unittest.TestCase):
             browser_executable=root / "chrome.exe",
             ready_url="http://127.0.0.1:1/",
             max_retries=0,
+            automation_enabled=True,
             permission_manager=None,
         )
 

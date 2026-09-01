@@ -23,6 +23,7 @@ from typing import Any
 from playwright.async_api import async_playwright
 
 from .api import LocalProfileAPI
+from .data_root import require_safe_product_data_root
 from .instance_lock import DataDirInstanceLock
 from .local_management_ui import UISettingsStore, start_management_ui_server
 from .permission_manager import PermissionManager
@@ -31,6 +32,7 @@ from .proxy_secret_store import ProxyCredentialStore
 
 
 READY_HTML = b"<!doctype html><title>Local Profile Manager Ready</title><main>ready</main>"
+PROFILE_STARTUP_MODE = "native_manual_default"
 
 
 async def _http_json(host: str, port: int, method: str, path: str) -> tuple[int, dict[str, Any]]:
@@ -66,7 +68,7 @@ def start_ready_server() -> tuple[ThreadingHTTPServer, str]:
 
 
 async def run(args: argparse.Namespace) -> dict[str, Any]:
-    data_dir = Path(args.data_dir).resolve()
+    data_dir = require_safe_product_data_root(Path(args.data_dir), api_port=args.port, ui_port=args.ui_port)
     chrome = Path(args.chrome).resolve()
     if not chrome.is_file():
         raise FileNotFoundError(f"chrome_not_found:{chrome}")
@@ -89,9 +91,15 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 ready_title="Local Profile Manager Ready",
                 soft_concurrency_limit=args.soft_concurrency_limit,
                 max_retries=2,
-                background_mode=True,
+                # V0.1 is a visible, user-operated native Chromium launch by
+                # default. Basic authenticated proxy profiles still use the
+                # retained Playwright launch path because credentials must not
+                # be placed in browser arguments.
+                background_mode=False,
+                automation_enabled=False,
                 permission_manager=PermissionManager(),
                 proxy_credentials=proxy_credentials,
+                download_root=data_dir / "downloads",
             )
             # Presentation preferences intentionally live outside registry.json.
             # Bootstrap creates only stopped records and only on the first
@@ -130,7 +138,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 "port": port,
                 "data_dir": str(data_dir),
                 "browser_executable": str(chrome),
-                "background_startup": "existing_formal_chain",
+                "profile_startup": PROFILE_STARTUP_MODE,
                 "hidden_mode": "experimental_enabled" if args.enable_experimental_hidden else "disabled_by_default_p0_1_pending",
                 "window_focus": "disabled",
                 "ui": {

@@ -29,6 +29,7 @@ from .fingerprint_config import (
     without_fingerprint_arguments,
 )
 from .network_config import normalize_network_config, proxy_launch_args, without_proxy_arguments
+from .downloads import ProfileDownloadManager, configure_chromium_download_preferences
 from .permission_manager import PermissionPolicyError
 
 
@@ -41,6 +42,18 @@ class ProfileManagerError(RuntimeError):
 
 class ProfileProcessProbeError(RuntimeError):
     pass
+
+
+RECOVERY_LIVE_PROCESSES = "recovery_required:live_profile_processes"
+RECOVERY_PROBE_FAILED = "recovery_required:process_probe_failed"
+PROCESS_PROBE_FAILED = "process_probe_failed"
+
+
+_PROCESS_PROBE_UTF8_PREFIX = (
+    "$utf8NoBom = [System.Text.UTF8Encoding]::new($false); "
+    "[Console]::OutputEncoding = $utf8NoBom; "
+    "$OutputEncoding = $utf8NoBom; "
+)
 
 
 @dataclass(frozen=True)
@@ -117,7 +130,7 @@ def foreground_snapshot() -> dict[str, int]:
 
 def probe_profile_processes(user_data_dir: Path) -> ProcessProbeResult:
     """Return an explicit found/absent/error result for one Profile probe."""
-    command = (
+    command = _PROCESS_PROBE_UTF8_PREFIX + (
         "$items=@(Get-CimInstance Win32_Process | Where-Object "
         "{$_.Name -eq 'chrome.exe' -and $_.CommandLine} | "
         "Select-Object ProcessId,Name,CommandLine); "
@@ -128,7 +141,6 @@ def probe_profile_processes(user_data_dir: Path) -> ProcessProbeResult:
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
             text=True,
             encoding="utf-8",
-            errors="replace",
             stderr=subprocess.DEVNULL,
             timeout=10,
         ).strip()
@@ -200,8 +212,10 @@ class ProfileManager:
         monitor_interval: float = 0.5,
         browser_args: list[str] | None = None,
         background_mode: bool = True,
+        automation_enabled: bool = False,
         permission_manager: Any | None = None,
         proxy_credentials: Any | None = None,
+        download_root: Path | None = None,
     ) -> None:
         self.playwright = playwright
         self.registry_path = Path(registry_path)
@@ -215,8 +229,10 @@ class ProfileManager:
         self.monitor_interval = monitor_interval
         self.browser_args = list(browser_args or [])
         self.background_mode = bool(background_mode)
+        self.automation_enabled = bool(automation_enabled)
         self.permission_manager = permission_manager
         self.proxy_credentials = proxy_credentials
+        self.download_root = Path(download_root) if download_root is not None else self.profiles_root.parent / "downloads"
         self._runtime: dict[str, dict[str, Any]] = {}
         self._records: dict[str, dict[str, Any]] = {}
         self._lifecycle_locks: dict[str, asyncio.Lock] = {}
@@ -303,10 +319,11 @@ class ProfileManager:
         elif expected != actual:
             raise ProfileManagerError("fingerprint_engine_hash_mismatch")
 
-    @staticmethod
-    def _public_status_record(record: dict[str, Any]) -> dict[str, Any]:
+    def _public_status_record(self, record: dict[str, Any]) -> dict[str, Any]:
         result = dict(record)
         result["fingerprint"] = public_fingerprint_status(record["fingerprint"])
+        runtime = self._runtime.get(str(record.get("id")))
+        result["automation_attached"] = bool(runtime and runtime.get("automation_attached"))
         return result
 
     def context_for(self, profile_id: str) -> Any:
@@ -316,7 +333,30 @@ class ProfileManager:
             raise ProfileManagerError(f"unknown profile: {profile_id}")
         if record.get("status") != "running" or runtime is None:
             raise ProfileManagerError(f"profile is not running: {profile_id}")
+        if not runtime.get("automation_attached"):
+            raise ProfileManagerError("automation_not_attached")
         return runtime["context"]
+
+    def download_manager_for(self, profile_id: str) -> ProfileDownloadManager:
+        runtime = self._runtime.get(profile_id)
+        if runtime is None or not runtime.get("automation_attached") or runtime.get("download_manager") is None:
+            raise ProfileManagerError("automation_not_attached")
+        return runtime["download_manager"]
+
+    def _download_directory_for(self, profile_id: str) -> Path:
+        root = self.download_root.resolve()
+        destination = (root / profile_id).resolve()
+        try:
+            destination.relative_to(root)
+        except ValueError as exc:
+            raise ProfileManagerError("download_directory_outside_root") from exc
+        return destination
+
+    def _record_download_error(self, profile_id: str, error: str) -> None:
+        record = self._records.get(profile_id)
+        if record is not None:
+            record["last_download_error"] = error
+            self._save()
 
     def create(self, profile_id: str, name: str | None = None) -> dict[str, Any]:
         if profile_id in self._records:
@@ -334,6 +374,7 @@ class ProfileManager:
             "retry_count": 0,
             "last_ready_at": None,
             "last_error": None,
+            "last_download_error": None,
             "root_pid": None,
             "debug_endpoint": None,
             "startup_stage": "stopped",
@@ -516,6 +557,39 @@ class ProfileManager:
             await asyncio.sleep(0.1)
         raise ProfileManagerError("cdp_endpoint_timeout")
 
+    async def _launch_manual_runtime(self, profile_id: str, record: dict[str, Any]) -> dict[str, Any]:
+        """Launch a Profile as an ordinary user-operated Chromium window."""
+        self._set_startup_stage(record, "starting_browser")
+        process = subprocess.Popen(
+            [
+                str(record["browser_executable"]),
+                f"--user-data-dir={record['user_data_dir']}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                *self._browser_args_for(record),
+            ],
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        record["root_pid"] = int(process.pid)
+        record["debug_endpoint"] = None
+        self._save()
+        return {
+            "process": process,
+            "root_pid": int(process.pid),
+            "browser": None,
+            "cdp": None,
+            "context": None,
+            "page": None,
+            "target_id": None,
+            "endpoint": None,
+            "permission_applied": [],
+            "proxy_auth_tasks": set(),
+            "automation_attached": False,
+            "manual_native": True,
+        }
+
     async def _launch_background_runtime(self, profile_id: str, record: dict[str, Any]) -> dict[str, Any]:
         profile_dir = Path(record["user_data_dir"])
         stale_port = profile_dir / "DevToolsActivePort"
@@ -604,7 +678,17 @@ class ProfileManager:
             "endpoint": endpoint,
             "permission_applied": permission_applied,
             "proxy_auth_tasks": proxy_auth_tasks,
+            "automation_attached": True,
+            "manual_native": False,
         }
+
+    def _request_manual_window_close(self, profile_id: str) -> list[int]:
+        """Ask top-level Chromium windows to close without using CDP."""
+        handles = query_profile_windows(Path(self._records[profile_id]["user_data_dir"]))
+        user32 = ctypes.windll.user32
+        for hwnd in handles:
+            user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+        return handles
 
     async def _shutdown_runtime(self, profile_id: str, runtime: dict[str, Any], *, fallback: bool = True) -> dict[str, Any]:
         record = self._records[profile_id]
@@ -613,8 +697,16 @@ class ProfileManager:
         context = runtime.get("context")
         browser = runtime.get("browser")
         cdp = runtime.get("cdp")
+        download_manager = runtime.get("download_manager")
+        if download_manager is not None:
+            await download_manager.close()
         for task in list(runtime.get("proxy_auth_tasks", set())):
             task.cancel()
+        if runtime.get("manual_native"):
+            try:
+                self._request_manual_window_close(profile_id)
+            except Exception as exc:
+                graceful_error = f"{type(exc).__name__}: {str(exc).splitlines()[0]}"
         if context is not None:
             for page in list(context.pages):
                 try:
@@ -704,35 +796,61 @@ class ProfileManager:
                 self._ensure_fingerprint_engine(record)
                 browser_args = self._browser_args_for(record)
                 persistent_proxy = self._persistent_proxy_for(profile_id, record)
-                if not self.background_mode or persistent_proxy is not None:
-                    launch_args = without_proxy_arguments(browser_args) if persistent_proxy is not None else browser_args
-                    context = await self.playwright.chromium.launch_persistent_context(
-                        user_data_dir=record["user_data_dir"],
-                        executable_path=record["browser_executable"],
-                        headless=False,
-                        viewport={"width": 1280, "height": 720},
-                        args=["--no-first-run", "--no-default-browser-check", *launch_args],
-                        proxy=persistent_proxy,
-                    )
-                    page = context.pages[0] if context.pages else await context.new_page()
-                    runtime = {"context": context, "browser": None, "cdp": None, "page": page, "root_pid": None, "target_id": None, "endpoint": None}
+                download_directory = self._download_directory_for(profile_id)
+                configure_chromium_download_preferences(Path(record["user_data_dir"]), download_directory)
+                use_automation = self.automation_enabled or persistent_proxy is not None
+                if not use_automation:
+                    runtime = await self._launch_manual_runtime(profile_id, record)
                 else:
-                    runtime = await self._launch_background_runtime(profile_id, record)
-                    context = runtime["context"]
-                    page = runtime["page"]
-                ready_url = self.ready_url
-                fixed_network = record["network"].get("mode") == "fixed"
-                if fixed_network:
-                    # Do not route the Manager's local readiness request through
-                    # an external per-Profile proxy.
-                    ready_url = "about:blank"
-                await page.goto(ready_url, wait_until="domcontentloaded", timeout=self.ready_timeout_ms)
-                if fixed_network and self.ready_title is not None:
-                    await page.evaluate("title => { document.title = title; }", self.ready_title)
-                title = await page.title()
-                await page.evaluate("() => document.readyState")
-                if self.ready_title is not None and title != self.ready_title:
-                    raise ProfileManagerError(f"ready_title_mismatch:{title}")
+                    if not self.background_mode or persistent_proxy is not None:
+                        launch_args = without_proxy_arguments(browser_args) if persistent_proxy is not None else browser_args
+                        context = await self.playwright.chromium.launch_persistent_context(
+                            user_data_dir=record["user_data_dir"],
+                            executable_path=record["browser_executable"],
+                            headless=False,
+                            viewport={"width": 1280, "height": 720},
+                            args=["--no-first-run", "--no-default-browser-check", *launch_args],
+                            proxy=persistent_proxy,
+                        )
+                        page = context.pages[0] if context.pages else await context.new_page()
+                        runtime = {
+                            "context": context,
+                            "browser": None,
+                            "cdp": None,
+                            "page": page,
+                            "root_pid": None,
+                            "target_id": None,
+                            "endpoint": None,
+                            "automation_attached": True,
+                            "manual_native": False,
+                        }
+                    else:
+                        runtime = await self._launch_background_runtime(profile_id, record)
+                        context = runtime["context"]
+                        page = runtime["page"]
+                    if runtime.get("cdp") is None and hasattr(context, "new_cdp_session"):
+                        runtime["cdp"] = await context.new_cdp_session(page)
+                    if runtime.get("cdp") is not None:
+                        download_manager = ProfileDownloadManager(
+                            profile_id,
+                            download_directory,
+                            on_error=lambda error, pid=profile_id: self._record_download_error(pid, error),
+                        )
+                        await download_manager.attach(runtime["cdp"])
+                        runtime["download_manager"] = download_manager
+                    ready_url = self.ready_url
+                    fixed_network = record["network"].get("mode") == "fixed"
+                    if fixed_network:
+                        # Do not route the Manager's local readiness request through
+                        # an external per-Profile proxy.
+                        ready_url = "about:blank"
+                    await page.goto(ready_url, wait_until="domcontentloaded", timeout=self.ready_timeout_ms)
+                    if fixed_network and self.ready_title is not None:
+                        await page.evaluate("title => { document.title = title; }", self.ready_title)
+                    title = await page.title()
+                    await page.evaluate("() => document.readyState")
+                    if self.ready_title is not None and title != self.ready_title:
+                        raise ProfileManagerError(f"ready_title_mismatch:{title}")
                 processes = await self._wait_for_processes(profile_id, True)
                 if not processes:
                     raise ProfileManagerError("browser_process_not_observed")
@@ -818,10 +936,11 @@ class ProfileManager:
                 continue
             if not processes:
                 expected = bool(runtime.get("expected_stop"))
-                try:
-                    await runtime["context"].close()
-                except Exception:
-                    pass
+                if runtime.get("context") is not None:
+                    try:
+                        await runtime["context"].close()
+                    except Exception:
+                        pass
                 try:
                     if runtime.get("browser") is not None:
                         await runtime["browser"].close()
@@ -865,7 +984,8 @@ class ProfileManager:
                 if runtime:
                     runtime["monitor"].cancel()
                     try:
-                        await runtime["context"].close()
+                        if runtime.get("context") is not None:
+                            await runtime["context"].close()
                     except Exception:
                         pass
                 record.update({"status": "error", "process_ids": [], "last_error": "browser_process_disappeared"})

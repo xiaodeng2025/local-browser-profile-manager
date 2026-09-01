@@ -1,5 +1,26 @@
 # PROJECT_STATE
 
+## Public review candidate: v0.1 native/manual and data-safety sync
+
+This public review branch is based on the public repository's own `main` and
+contains only a semantic, allowlisted migration. It does not import private
+Git history, private continuity documents, validation artifacts, runtime data,
+machine paths, or credentials.
+
+The review scope is limited to visible native manual Profile startup, UTF-8
+safe Windows/CIM process probing, Profile-specific native download paths, and
+canonical product data-root protection. The existing public instance lock,
+Windows-protected proxy credential store, and redacted fixed-fingerprint
+surface remain part of this repository.
+
+The canonical `profile-data` root is created with its non-sensitive marker only
+when the exact root is absent on first default-port startup. Existing unmarked
+or non-canonical roots remain rejected. The startup status uses
+`profile_startup: native_manual_default`.
+
+The branch is for review only. No public `main` change is implied until the
+tests, documentation, license notices, and sensitive-data audit are accepted.
+
 更新时间：2026-08-28
 
 ## Public-R1 本地候选（2026-08-28）
